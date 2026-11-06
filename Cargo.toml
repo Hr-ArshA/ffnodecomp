@@ -1,0 +1,20 @@
+[package]
+name = "ffnodecomp"
+version = "0.1.0"
+edition = "2021"
+description = "Node-based FFmpeg compositor MVP"
+
+[dependencies]
+# egui 0.29 is deliberately not used: current eframe/egui is 0.37 and
+# egui_node_graph2 has not caught up. The canvas in ui/canvas.rs is small.
+eframe = "0.37"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+
+# Debug builds of egui are unusably slow without a little optimisation.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
