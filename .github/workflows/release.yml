@@ -19,14 +19,14 @@ jobs:
           # Linux x86_64
           - name: Linux x86_64
             os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-linux
             bin_name: ffnodecomp
             archive_ext: tar.gz
 
           # Windows x86_64
           - name: Windows x86_64
             os: windows-latest
-            target: x86_64-pc-windows-msvc
+            target: x86_64-windows
             bin_name: ffnodecomp.exe
             archive_ext: zip
 
