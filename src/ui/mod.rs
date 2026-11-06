@@ -290,7 +290,16 @@ impl App {
                             self.add_node(NodeKind::Overlay { x: 0, y: 0 });
                         }
                         ui.end_row();
-                        if ui.button("Output").clicked() {
+                        let has_output = self
+                            .graph
+                            .nodes
+                            .iter()
+                            .any(|n| matches!(n.kind, NodeKind::Output { .. }));
+                        if ui
+                            .add_enabled(!has_output, egui::Button::new("Output"))
+                            .on_disabled_hover_text("Graph already has an Output node")
+                            .clicked()
+                        {
                             self.add_node(NodeKind::Output {
                                 width: 1280,
                                 height: 720,

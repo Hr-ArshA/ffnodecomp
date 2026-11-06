@@ -118,6 +118,10 @@ impl Compiled {
             // h264_vaapi expects the hwupload/nv12 surface, not yuv420p.
             args.extend(["-pix_fmt", "yuv420p"].map(String::from));
         }
+        // ponytail: audio mixing for multiple sources; pass primary input audio for now.
+        if !self.inputs.is_empty() {
+            args.extend(["-map", "0:a?", "-c:a", "aac"].map(String::from));
+        }
         args.extend(["-y", out].map(String::from));
         args
     }
@@ -265,6 +269,7 @@ pub fn compile(graph: &Graph) -> Result<Compiled, String> {
     // 4. FFmpeg inputs and the link -> label map. Solid Color and text-only
     //    sources have no `-i`; Image does, with a loop/duration.
     let mut inputs = Vec::new();
+    let mut node_inputs: HashMap<NodeId, usize> = HashMap::new();
     for node in &graph.nodes {
         if !reachable.contains(&node.id) {
             continue;
@@ -274,7 +279,9 @@ pub fn compile(graph: &Graph) -> Result<Compiled, String> {
                 if path.trim().is_empty() {
                     return Err(format!("Input node #{} has no file", node.id));
                 }
+                let idx = inputs.len();
                 inputs.push(InputSpec::file(path.clone()));
+                node_inputs.insert(node.id, idx);
             }
             NodeKind::Image {
                 path,
@@ -284,11 +291,13 @@ pub fn compile(graph: &Graph) -> Result<Compiled, String> {
                 if path.trim().is_empty() {
                     return Err(format!("Image node #{} has no file", node.id));
                 }
+                let idx = inputs.len();
                 inputs.push(InputSpec {
                     path: path.clone(),
                     extra: image::input_options(*duration, *framerate),
                     decode: false,
                 });
+                node_inputs.insert(node.id, idx);
             }
             _ => {}
         }
@@ -327,25 +336,29 @@ pub fn compile(graph: &Graph) -> Result<Compiled, String> {
     for &id in &order {
         let node = &graph.nodes[id];
 
-        let mut labels_in = Vec::with_capacity(node.kind.inputs().len());
-        for port in 0..node.kind.inputs().len() {
-            match incoming.get(&(id, port)) {
-                Some(link_index) => {
-                    let label = link_label[*link_index]
-                        .clone()
-                        .ok_or_else(|| format!("internal: unlabelled link into node #{id}"))?;
-                    labels_in.push(label);
-                }
-                // Optional ports (the Alpha Key mask) simply do not
-                // participate in the filter when unconnected.
-                None if node.kind.inputs()[port].optional => {}
-                None => {
-                    return Err(format!(
-                        "{} node #{} is missing its '{}' input",
-                        node.kind.title(),
-                        id,
-                        node.kind.inputs()[port].name
-                    ))
+        let mut labels_in = Vec::with_capacity(node.kind.inputs().len().max(1));
+        if let Some(&input_idx) = node_inputs.get(&id) {
+            labels_in.push(format!("[{input_idx}:v]"));
+        } else {
+            for port in 0..node.kind.inputs().len() {
+                match incoming.get(&(id, port)) {
+                    Some(link_index) => {
+                        let label = link_label[*link_index]
+                            .clone()
+                            .ok_or_else(|| format!("internal: unlabelled link into node #{id}"))?;
+                        labels_in.push(label);
+                    }
+                    // Optional ports (the Alpha Key mask) simply do not
+                    // participate in the filter when unconnected.
+                    None if node.kind.inputs()[port].optional => {}
+                    None => {
+                        return Err(format!(
+                            "{} node #{} is missing its '{}' input",
+                            node.kind.title(),
+                            id,
+                            node.kind.inputs()[port].name
+                        ))
+                    }
                 }
             }
         }
@@ -387,13 +400,11 @@ pub fn compile(graph: &Graph) -> Result<Compiled, String> {
                 x,
                 y,
             } => {
-                let width = even(*width).min(canvas_w);
-                let height = even(*height).min(canvas_h);
-                let x = (*x).min(canvas_w - width);
-                let y = (*y).min(canvas_h - height);
+                let width = even(*width);
+                let height = even(*height);
                 format!(
                     "scale={width}:{height}:flags=bicubic,\
-                     pad={canvas_w}:{canvas_h}:{x}:{y}:color=black@0,setsar=1"
+                     pad=max(iw\\,{canvas_w}):max(ih\\,{canvas_h}):{x}:{y}:color=black@0,setsar=1"
                 )
             }
             NodeKind::Color {
@@ -407,7 +418,7 @@ pub fn compile(graph: &Graph) -> Result<Compiled, String> {
                 saturation.clamp(0.0, 3.0)
             ),
             NodeKind::Overlay { x, y } => {
-                format!("overlay=x={x}:y={y}:format=auto,format=rgba,setsar=1")
+                format!("overlay=x={x}:y={y}:eof_action=pass:format=auto,format=rgba,setsar=1")
             }
             NodeKind::ColorKey {
                 color,
@@ -428,13 +439,23 @@ pub fn compile(graph: &Graph) -> Result<Compiled, String> {
                 softness,
             } => {
                 if has_mask {
-                    // alphamerge uses the mask's luma as the output alpha.
-                    match mode {
-                        KeyMode::InvertAlpha => {
-                            "alphamerge,lutrgb=a='255-val',format=rgba".into()
-                        }
-                        _ => "alphamerge,format=rgba".into(),
-                    }
+                    let vid = &labels_in[0];
+                    let mask = &labels_in[1];
+                    let s_mask = format!("[n{id}m]");
+                    let s_vid = format!("[n{id}v]");
+                    let invert = if *mode == KeyMode::InvertAlpha {
+                        ",lutrgb=a='255-val'"
+                    } else {
+                        ""
+                    };
+                    emit(
+                        &mut filter_complex,
+                        &[mask.clone(), vid.clone()],
+                        "scale2ref",
+                        &[s_mask.clone(), s_vid.clone()],
+                    );
+                    labels_in = vec![s_vid, s_mask];
+                    format!("alphamerge{invert},format=rgba")
                 } else {
                     match mode {
                         KeyMode::LumaKey => format!(
@@ -443,7 +464,7 @@ pub fn compile(graph: &Graph) -> Result<Compiled, String> {
                             tolerance.clamp(0.0, 1.0),
                             softness.clamp(0.0, 1.0)
                         ),
-                        KeyMode::ExtractAlpha => "format=rgba".into(),
+                        KeyMode::ExtractAlpha => "format=rgba,alphaextract,format=rgba".into(),
                         KeyMode::InvertAlpha => "format=rgba,lutrgb=a='255-val'".into(),
                     }
                 }
@@ -948,5 +969,75 @@ mod tests {
             String::from_utf8_lossy(&proc.stderr)
         );
         assert_eq!(proc.stdout.len(), 640 * 360 * 4);
+    }
+
+    #[test]
+    fn explicit_stream_labels_and_pipeline_fixes() {
+        let mut graph = Graph::default();
+        let a = graph.add_node(input(), [0.0, 0.0]);
+        let b = graph.add_node(
+            NodeKind::Image {
+                path: "/tmp/b.png".into(),
+                duration: 5.0,
+                framerate: 30,
+            },
+            [0.0, 0.0],
+        );
+        let overlay = graph.add_node(NodeKind::Overlay { x: 10, y: 20 }, [0.0, 0.0]);
+        let out = graph.add_node(output(1280, 720), [0.0, 0.0]);
+        link(&mut graph, a, 0, overlay, 0);
+        link(&mut graph, b, 0, overlay, 1);
+        link(&mut graph, overlay, 0, out, 0);
+
+        let compiled = compile(&graph).expect("compiles");
+        assert!(compiled.filter_complex.contains("[0:v]format=rgba,setsar=1"));
+        assert!(compiled.filter_complex.contains("[1:v]format=rgba,setsar=1"));
+        assert!(compiled.filter_complex.contains("overlay=x=10:y=20:eof_action=pass"));
+
+        let export_args = compiled.export_args("/tmp/out.mp4", Accel::Cpu);
+        assert!(export_args.windows(2).any(|w| w[0] == "-map" && w[1] == "0:a?"));
+        assert!(export_args.windows(2).any(|w| w[0] == "-c:a" && w[1] == "aac"));
+    }
+
+    #[test]
+    fn extract_alpha_and_scaled_mask_alphamerge() {
+        let mut graph = Graph::default();
+        let a = graph.add_node(input(), [0.0, 0.0]);
+        let key = graph.add_node(
+            NodeKind::AlphaKey {
+                mode: KeyMode::ExtractAlpha,
+                threshold: 0.5,
+                tolerance: 0.1,
+                softness: 0.2,
+            },
+            [0.0, 0.0],
+        );
+        let out = graph.add_node(output(1280, 720), [0.0, 0.0]);
+        link(&mut graph, a, 0, key, 0);
+        link(&mut graph, key, 0, out, 0);
+
+        let compiled = compile(&graph).expect("compiles");
+        assert!(compiled.filter_complex.contains("alphaextract"));
+
+        let mut mask_graph = Graph::default();
+        let vid = mask_graph.add_node(input(), [0.0, 0.0]);
+        let mask = mask_graph.add_node(input(), [0.0, 0.0]);
+        let akey = mask_graph.add_node(
+            NodeKind::AlphaKey {
+                mode: KeyMode::LumaKey,
+                threshold: 0.5,
+                tolerance: 0.1,
+                softness: 0.2,
+            },
+            [0.0, 0.0],
+        );
+        let out2 = mask_graph.add_node(output(1280, 720), [0.0, 0.0]);
+        link(&mut mask_graph, vid, 0, akey, 0);
+        link(&mut mask_graph, mask, 0, akey, 1);
+        link(&mut mask_graph, akey, 0, out2, 0);
+
+        let compiled_mask = compile(&mask_graph).expect("compiles");
+        assert!(compiled_mask.filter_complex.contains("scale2ref"));
+        assert!(compiled_mask.filter_complex.contains("alphamerge"));
     }
 }
