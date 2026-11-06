@@ -990,13 +990,23 @@ mod tests {
         link(&mut graph, overlay, 0, out, 0);
 
         let compiled = compile(&graph).expect("compiles");
-        assert!(compiled.filter_complex.contains("[0:v]format=rgba,setsar=1"));
-        assert!(compiled.filter_complex.contains("[1:v]format=rgba,setsar=1"));
-        assert!(compiled.filter_complex.contains("overlay=x=10:y=20:eof_action=pass"));
+        assert!(compiled
+            .filter_complex
+            .contains("[0:v]format=rgba,setsar=1"));
+        assert!(compiled
+            .filter_complex
+            .contains("[1:v]format=rgba,setsar=1"));
+        assert!(compiled
+            .filter_complex
+            .contains("overlay=x=10:y=20:eof_action=pass"));
 
         let export_args = compiled.export_args("/tmp/out.mp4", Accel::Cpu);
-        assert!(export_args.windows(2).any(|w| w[0] == "-map" && w[1] == "0:a?"));
-        assert!(export_args.windows(2).any(|w| w[0] == "-c:a" && w[1] == "aac"));
+        assert!(export_args
+            .windows(2)
+            .any(|w| w[0] == "-map" && w[1] == "0:a?"));
+        assert!(export_args
+            .windows(2)
+            .any(|w| w[0] == "-c:a" && w[1] == "aac"));
     }
 
     #[test]

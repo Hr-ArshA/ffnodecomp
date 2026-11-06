@@ -58,7 +58,7 @@ impl App {
         let mut clicked_edge = None;
         let mut right_clicked_edge = None;
 
-        let over_node = pointer_pos.map_or(false, |pos| {
+        let over_node = pointer_pos.is_some_and(|pos| {
             self.graph
                 .nodes
                 .iter()
@@ -452,6 +452,8 @@ fn rect_for(node: &Node, origin: Pos2) -> Rect {
 
 fn inline_height(kind: &NodeKind) -> f32 {
     match kind {
+        NodeKind::Input { .. } => 24.0,
+        NodeKind::Image { .. } => 24.0,
         NodeKind::ColorKey { .. } => 64.0,
         NodeKind::AlphaKey { .. } => 84.0,
         _ => 0.0,
@@ -463,6 +465,46 @@ fn inline_controls(ui: &mut egui::Ui, id: NodeId, kind: &mut NodeKind) -> bool {
     let mut changed = false;
 
     match kind {
+        NodeKind::Input { path } => {
+            let label = if path.trim().is_empty() {
+                "Select video..."
+            } else {
+                "Change video..."
+            };
+            if ui.button(egui::RichText::new(label).size(10.0)).clicked() {
+                let mut dialog = rfd::FileDialog::new()
+                    .add_filter("Video", &["mp4", "mkv", "mov", "avi", "webm", "flv", "m4v"]);
+                if let Some(parent) = std::path::Path::new(path).parent() {
+                    if parent.exists() && parent != std::path::Path::new("") {
+                        dialog = dialog.set_directory(parent);
+                    }
+                }
+                if let Some(file) = dialog.pick_file() {
+                    *path = file.to_string_lossy().into_owned();
+                    changed = true;
+                }
+            }
+        }
+        NodeKind::Image { path, .. } => {
+            let label = if path.trim().is_empty() {
+                "Select image..."
+            } else {
+                "Change image..."
+            };
+            if ui.button(egui::RichText::new(label).size(10.0)).clicked() {
+                let mut dialog = rfd::FileDialog::new()
+                    .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif"]);
+                if let Some(parent) = std::path::Path::new(path).parent() {
+                    if parent.exists() && parent != std::path::Path::new("") {
+                        dialog = dialog.set_directory(parent);
+                    }
+                }
+                if let Some(file) = dialog.pick_file() {
+                    *path = file.to_string_lossy().into_owned();
+                    changed = true;
+                }
+            }
+        }
         NodeKind::ColorKey {
             color,
             similarity,

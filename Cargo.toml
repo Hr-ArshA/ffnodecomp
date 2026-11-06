@@ -8,6 +8,7 @@ description = "Node-based FFmpeg compositor MVP"
 # egui 0.29 is deliberately not used: current eframe/egui is 0.37 and
 # egui_node_graph2 has not caught up. The canvas in ui/canvas.rs is small.
 eframe = "0.37"
+rfd = "0.17.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }

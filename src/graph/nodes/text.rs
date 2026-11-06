@@ -24,7 +24,10 @@ fn sanitize_expr(value: &str, default: &str) -> String {
     }
     let valid = trimmed.chars().all(|c| {
         c.is_ascii_alphanumeric()
-            || matches!(c, '+' | '-' | '*' | '/' | '%' | '^' | '(' | ')' | '.' | '_' | ' ')
+            || matches!(
+                c,
+                '+' | '-' | '*' | '/' | '%' | '^' | '(' | ')' | '.' | '_' | ' '
+            )
     });
     if valid {
         trimmed.to_string()

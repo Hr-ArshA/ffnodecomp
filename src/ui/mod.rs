@@ -48,7 +48,9 @@ pub struct App {
     dragging: Option<(NodeId, egui::Vec2)>,
 
     status: Option<(String, bool)>,
-    export_rx: Option<Receiver<String>>,
+    export_path: String,
+    export_progress: f32,
+    export_rx: Option<Receiver<engine::ExportMsg>>,
 }
 
 impl App {
@@ -84,6 +86,8 @@ impl App {
             wire_drag: false,
             dragging: None,
             status,
+            export_path: EXPORT_FILE.to_string(),
+            export_progress: 0.0,
             export_rx: None,
         }
     }
@@ -228,16 +232,46 @@ impl App {
                 }
 
                 ui.separator();
-                let can_export = self.compiled.is_some() && self.export_rx.is_none();
+                ui.label("Export:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.export_path)
+                        .desired_width(120.0)
+                        .hint_text("export.mp4"),
+                );
+                if ui
+                    .button("Browse...")
+                    .on_hover_text("Choose export destination")
+                    .clicked()
+                {
+                    let mut dialog = rfd::FileDialog::new()
+                        .set_file_name(&self.export_path)
+                        .add_filter("MP4 Video", &["mp4"]);
+                    if let Some(parent) = std::path::Path::new(&self.export_path).parent() {
+                        if parent.exists() && parent != std::path::Path::new("") {
+                            dialog = dialog.set_directory(parent);
+                        }
+                    }
+                    if let Some(file) = dialog.save_file() {
+                        self.export_path = file.to_string_lossy().into_owned();
+                    }
+                }
+
+                let can_export = self.compiled.is_some()
+                    && self.export_rx.is_none()
+                    && !self.export_path.trim().is_empty();
                 if ui
                     .add_enabled(can_export, egui::Button::new("Export MP4"))
-                    .on_hover_text("Renders the graph to export.mp4")
+                    .on_hover_text(format!("Renders the graph to {}", self.export_path))
                     .clicked()
                 {
                     self.start_export();
                 }
                 if self.export_rx.is_some() {
-                    ui.spinner();
+                    ui.add(
+                        egui::ProgressBar::new(self.export_progress)
+                            .show_percentage()
+                            .desired_width(100.0),
+                    );
                 }
             });
 
@@ -390,9 +424,26 @@ impl App {
             match kind {
                 NodeKind::Input { path } => {
                     ui.label("Video file");
-                    changed |= ui.text_edit_singleline(path).changed();
+                    ui.horizontal(|ui| {
+                        changed |= ui.text_edit_singleline(path).changed();
+                        if ui.button("Browse...").clicked() {
+                            let mut dialog = rfd::FileDialog::new().add_filter(
+                                "Video",
+                                &["mp4", "mkv", "mov", "avi", "webm", "flv", "m4v"],
+                            );
+                            if let Some(parent) = std::path::Path::new(path).parent() {
+                                if parent.exists() && parent != std::path::Path::new("") {
+                                    dialog = dialog.set_directory(parent);
+                                }
+                            }
+                            if let Some(file) = dialog.pick_file() {
+                                *path = file.to_string_lossy().into_owned();
+                                changed = true;
+                            }
+                        }
+                    });
                     ui.label(
-                        egui::RichText::new("Paste an absolute path; media stays in place.")
+                        egui::RichText::new("Choose a video file or paste an absolute path.")
                             .small()
                             .weak(),
                     );
@@ -581,7 +632,22 @@ impl App {
                         );
                     }
                     ui.label("Font file (optional)");
-                    changed |= ui.text_edit_singleline(font_file).changed();
+                    ui.horizontal(|ui| {
+                        changed |= ui.text_edit_singleline(font_file).changed();
+                        if ui.button("Browse...").clicked() {
+                            let mut dialog = rfd::FileDialog::new()
+                                .add_filter("Fonts", &["ttf", "otf", "woff", "woff2"]);
+                            if let Some(parent) = std::path::Path::new(font_file).parent() {
+                                if parent.exists() && parent != std::path::Path::new("") {
+                                    dialog = dialog.set_directory(parent);
+                                }
+                            }
+                            if let Some(file) = dialog.pick_file() {
+                                *font_file = file.to_string_lossy().into_owned();
+                                changed = true;
+                            }
+                        }
+                    });
                     ui.horizontal(|ui| {
                         ui.label("Duration");
                         changed |= ui
@@ -607,7 +673,24 @@ impl App {
                     framerate,
                 } => {
                     ui.label("Image file");
-                    changed |= ui.text_edit_singleline(path).changed();
+                    ui.horizontal(|ui| {
+                        changed |= ui.text_edit_singleline(path).changed();
+                        if ui.button("Browse...").clicked() {
+                            let mut dialog = rfd::FileDialog::new().add_filter(
+                                "Images",
+                                &["png", "jpg", "jpeg", "webp", "bmp", "gif"],
+                            );
+                            if let Some(parent) = std::path::Path::new(path).parent() {
+                                if parent.exists() && parent != std::path::Path::new("") {
+                                    dialog = dialog.set_directory(parent);
+                                }
+                            }
+                            if let Some(file) = dialog.pick_file() {
+                                *path = file.to_string_lossy().into_owned();
+                                changed = true;
+                            }
+                        }
+                    });
                     egui::Grid::new("image_grid").num_columns(2).show(ui, |ui| {
                         ui.label("Duration");
                         changed |= ui
@@ -762,50 +845,75 @@ impl App {
             return;
         };
 
+        let out_path = self.export_path.clone();
+        let total_duration = engine::estimated_duration(&self.graph);
         let accel = self.accel;
-        let gpu_args = compiled.export_args(EXPORT_FILE, accel);
-        let cpu_args = compiled.export_args(EXPORT_FILE, Accel::Cpu);
+        let gpu_args = compiled.export_args(&out_path, accel);
+        let cpu_args = compiled.export_args(&out_path, Accel::Cpu);
         let (tx, rx) = channel();
 
         std::thread::spawn(move || {
-            let message = if accel == Accel::Cpu {
-                match engine::run_blocking(&gpu_args) {
-                    Ok(()) => format!("Export finished: {EXPORT_FILE}"),
-                    Err(error) => format!("Export failed: {error}"),
+            let tx_prog = tx.clone();
+            let run_with_progress = |args: &[String]| {
+                let tx = tx_prog.clone();
+                engine::run_export(args, total_duration, move |frac| {
+                    let _ = tx.send(engine::ExportMsg::Progress(frac));
+                })
+            };
+
+            let res = if accel == Accel::Cpu {
+                match run_with_progress(&gpu_args) {
+                    Ok(()) => Ok(format!("Export finished: {out_path}")),
+                    Err(error) => Err(format!("Export failed: {error}")),
                 }
             } else {
-                match engine::run_blocking(&gpu_args) {
-                    Ok(()) => format!("Export finished: {EXPORT_FILE}"),
-                    Err(gpu_error) => match engine::run_blocking(&cpu_args) {
-                        Ok(()) => format!("Export finished: {EXPORT_FILE} (CPU fallback)"),
+                match run_with_progress(&gpu_args) {
+                    Ok(()) => Ok(format!("Export finished: {out_path}")),
+                    Err(gpu_error) => match run_with_progress(&cpu_args) {
+                        Ok(()) => Ok(format!("Export finished: {out_path} (CPU fallback)")),
                         Err(cpu_error) => {
-                            format!("Export failed: {cpu_error} (GPU: {gpu_error})")
+                            Err(format!("Export failed: {cpu_error} (GPU: {gpu_error})"))
                         }
                     },
                 }
             };
-            let _ = tx.send(message);
+            let _ = tx.send(engine::ExportMsg::Finished(res));
         });
 
+        self.export_progress = 0.0;
         self.export_rx = Some(rx);
-        self.notify(format!("Exporting {EXPORT_FILE}..."), true);
+        self.notify(format!("Exporting {}...", self.export_path), true);
     }
 
     fn poll_export(&mut self) {
         let Some(rx) = &self.export_rx else {
             return;
         };
-        match rx.try_recv() {
-            Ok(message) => {
-                let ok = message.starts_with("Export finished");
-                self.status = Some((message, ok));
-                self.export_rx = None;
+        loop {
+            match rx.try_recv() {
+                Ok(engine::ExportMsg::Progress(frac)) => {
+                    self.export_progress = frac;
+                }
+                Ok(engine::ExportMsg::Finished(res)) => {
+                    match res {
+                        Ok(msg) => {
+                            self.export_progress = 1.0;
+                            self.status = Some((msg, true));
+                        }
+                        Err(err) => {
+                            self.status = Some((err, false));
+                        }
+                    }
+                    self.export_rx = None;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.export_rx = None;
+                    self.notify("Export worker stopped unexpectedly", false);
+                    break;
+                }
             }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.export_rx = None;
-                self.notify("Export worker stopped unexpectedly", false);
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
     }
 
@@ -847,7 +955,7 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(30));
         }
         if self.export_rx.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(250));
+            ctx.request_repaint_after(Duration::from_millis(50));
         }
     }
 }

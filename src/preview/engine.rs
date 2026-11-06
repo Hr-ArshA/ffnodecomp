@@ -59,6 +59,11 @@ pub enum PreviewMsg {
     },
 }
 
+pub enum ExportMsg {
+    Progress(f32),
+    Finished(Result<String, String>),
+}
+
 pub struct PreviewEngine {
     rt: Runtime,
     tx: UnboundedSender<PreviewMsg>,
@@ -206,17 +211,155 @@ async fn run_frame(args: &[String]) -> Result<Vec<u8>, String> {
     Ok(pixels)
 }
 
-/// Blocking helper for exports. Called from a plain thread, not the UI thread.
-pub fn run_blocking(args: &[String]) -> Result<(), String> {
-    let output = std::process::Command::new("ffmpeg")
-        .args(args)
+/// Runs export with live progress reports via `-progress pipe:1`.
+pub fn run_export(
+    args: &[String],
+    total_duration: f32,
+    mut on_progress: impl FnMut(f32),
+) -> Result<(), String> {
+    let mut cmd_args = Vec::with_capacity(args.len() + 2);
+    let mut added = false;
+    for arg in args {
+        if arg == "-y" && !added {
+            cmd_args.push("-progress".to_string());
+            cmd_args.push("pipe:1".to_string());
+            added = true;
+        }
+        cmd_args.push(arg.clone());
+    }
+    if !added {
+        cmd_args.push("-progress".to_string());
+        cmd_args.push("pipe:1".to_string());
+    }
+
+    let mut child = std::process::Command::new("ffmpeg")
+        .args(&cmd_args)
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("could not start ffmpeg: {e}"))?;
-    if output.status.success() {
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("could not capture ffmpeg stdout")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or("could not capture ffmpeg stderr")?;
+
+    let err_handle = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+
+    use std::io::{BufRead, BufReader};
+    let reader = BufReader::new(stdout);
+    for line in reader.lines().map_while(Result::ok) {
+        if let Some(rest) = line.strip_prefix("out_time_us=") {
+            if let Ok(us) = rest.trim().parse::<f32>() {
+                if total_duration > 0.0 {
+                    let frac = (us / 1_000_000.0 / total_duration).clamp(0.0, 0.99);
+                    on_progress(frac);
+                }
+            }
+        } else if line.starts_with("progress=end") {
+            on_progress(1.0);
+        }
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("ffmpeg wait failed: {e}"))?;
+    let stderr_bytes = err_handle.join().unwrap_or_default();
+
+    if status.success() {
+        on_progress(1.0);
         Ok(())
     } else {
-        Err(format!("ffmpeg failed: {}", error_tail(&output.stderr)))
+        Err(format!("ffmpeg failed: {}", error_tail(&stderr_bytes)))
+    }
+}
+
+pub fn probe_duration(path: &str) -> Option<f32> {
+    if path.trim().is_empty() {
+        return None;
+    }
+    if let Ok(out) = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            path,
+        ])
+        .output()
+    {
+        if out.status.success() {
+            if let Ok(text) = std::str::from_utf8(&out.stdout) {
+                if let Ok(dur) = text.trim().parse::<f32>() {
+                    if dur > 0.0 {
+                        return Some(dur);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(out) = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-i", path])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&out.stderr);
+        if let Some(pos) = text.find("Duration: ") {
+            let rem = &text[pos + 10..];
+            let time_str = rem.split([',', ' ']).next().unwrap_or("");
+            let parts: Vec<&str> = time_str.split(':').collect();
+            if parts.len() == 3 {
+                if let (Ok(h), Ok(m), Ok(s)) = (
+                    parts[0].parse::<f32>(),
+                    parts[1].parse::<f32>(),
+                    parts[2].parse::<f32>(),
+                ) {
+                    let total = h * 3600.0 + m * 60.0 + s;
+                    if total > 0.0 {
+                        return Some(total);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+pub fn estimated_duration(graph: &crate::graph::node::Graph) -> f32 {
+    use crate::graph::node::NodeKind;
+    let mut max_dur: f32 = 0.0;
+    for node in &graph.nodes {
+        match &node.kind {
+            NodeKind::SolidColor { duration, .. }
+            | NodeKind::Image { duration, .. }
+            | NodeKind::Text { duration, .. } => {
+                max_dur = max_dur.max(*duration);
+            }
+            NodeKind::Input { path } => {
+                if let Some(dur) = probe_duration(path) {
+                    max_dur = max_dur.max(dur);
+                }
+            }
+            _ => {}
+        }
+    }
+    if max_dur > 0.0 {
+        max_dur
+    } else {
+        5.0
     }
 }
 
@@ -241,4 +384,58 @@ fn error_tail(stderr: &[u8]) -> String {
 fn short(message: &str) -> String {
     let first = message.lines().next().unwrap_or(message);
     first.chars().take(160).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_duration_nonexistent_returns_none() {
+        assert_eq!(probe_duration(""), None);
+        assert_eq!(probe_duration("/tmp/nonexistent_file_12345.mp4"), None);
+    }
+
+    #[test]
+    fn run_export_reports_progress_and_completes() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+
+        let out = "/tmp/opencode/export_test.mp4";
+        let args = vec![
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-f".into(),
+            "lavfi".into(),
+            "-i".into(),
+            "testsrc=duration=1:size=320x240:rate=30".into(),
+            "-c:v".into(),
+            "libx264".into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+            "-y".into(),
+            out.into(),
+        ];
+
+        let mut progress_called = false;
+        let mut final_reached = false;
+        let res = run_export(&args, 1.0, |frac| {
+            progress_called = true;
+            if frac >= 0.99 {
+                final_reached = true;
+            }
+        });
+
+        assert!(res.is_ok(), "run_export succeeded");
+        assert!(progress_called, "progress callback was invoked");
+        assert!(final_reached, "progress reached 1.0");
+        assert!(std::path::Path::new(out).exists(), "output file exists");
+        let _ = std::fs::remove_file(out);
+    }
 }

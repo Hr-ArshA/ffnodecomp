@@ -53,7 +53,9 @@ Paste an absolute video path into the Input node, then use the timestamp slider.
 ### Controls & Export
 
 - **Save graph** / **Load graph**: saves to / loads from `graph.json` in the working directory.
-- **Export MP4**: renders the graph to `export.mp4` using H.264.
+- **File Chooser**: native file selection dialogs (`rfd`) for video (`Input`), image (`Image`), and font (`Text`) paths on both the canvas cards and inspector panel.
+- **Configurable Export Destination**: choose any output path or use the file save dialog in the top bar.
+- **Live Progress Bar**: tracks and displays FFmpeg encoding progress in real time via `-progress pipe:1`.
 - **GPU Acceleration**: CUDA, VAAPI, VideoToolbox, or CPU software decode/encode.
   Failed GPU calls fall back to CPU automatically and display diagnostics in the viewer panel.
 
@@ -82,6 +84,4 @@ src/ui/mod.rs            app state, graph_version monotonic counter, inspector, 
 - GPU acceleration is decode/encode only. Filter graph execution runs on the CPU
   because `-hwaccel_output_format` would break `eq`, `pad`, and `overlay`.
 - Audio ports exist in the type system but no MVP node produces audio.
-- The file chooser is a path text field; no native dialog dependency.
 - One Output node drives the render. Extra Output nodes are ignored.
-- Export is a background thread with no progress bar and a fixed filename (`export.mp4`).
