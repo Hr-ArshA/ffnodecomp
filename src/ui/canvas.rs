@@ -58,21 +58,30 @@ impl App {
         let mut clicked_edge = None;
         let mut right_clicked_edge = None;
 
+        let over_node = pointer_pos.map_or(false, |pos| {
+            self.graph
+                .nodes
+                .iter()
+                .any(|node| rect_for(node, area.min).contains(pos))
+        });
+
         if let Some(pos) = pointer_pos {
-            let mut best_dist = 10.0; // 10px hit radius
-            for (index, link) in self.graph.links.iter().enumerate() {
-                if let (Some(from), Some(to)) = (
-                    outputs.get(&(link.from, link.from_port)),
-                    inputs.get(&(link.to, link.to_port)),
-                ) {
-                    let d = bezier_distance(*from, *to, pos);
-                    if d < best_dist {
-                        best_dist = d;
-                        if ui.input(|i| i.pointer.primary_clicked()) {
-                            clicked_edge = Some(index);
-                        }
-                        if ui.input(|i| i.pointer.secondary_clicked()) {
-                            right_clicked_edge = Some(index);
+            if !over_node {
+                let mut best_dist = 10.0; // 10px hit radius
+                for (index, link) in self.graph.links.iter().enumerate() {
+                    if let (Some(from), Some(to)) = (
+                        outputs.get(&(link.from, link.from_port)),
+                        inputs.get(&(link.to, link.to_port)),
+                    ) {
+                        let d = bezier_distance(*from, *to, pos);
+                        if d < best_dist {
+                            best_dist = d;
+                            if ui.input(|i| i.pointer.primary_clicked()) {
+                                clicked_edge = Some(index);
+                            }
+                            if ui.input(|i| i.pointer.secondary_clicked()) {
+                                right_clicked_edge = Some(index);
+                            }
                         }
                     }
                 }

@@ -10,19 +10,26 @@ fn position_expr(pos: TextPos, custom_x: &str, custom_y: &str) -> (String, Strin
         TextPos::Center => ("(w-text_w)/2".into(), "(h-text_h)/2".into()),
         TextPos::TopCenter => ("(w-text_w)/2".into(), "24".into()),
         TextPos::BottomCenter => ("(w-text_w)/2".into(), "h-text_h-24".into()),
-        TextPos::CustomXY => {
-            let fallback = |value: &str, default: &str| {
-                if value.trim().is_empty() {
-                    default.to_string()
-                } else {
-                    value.trim().to_string()
-                }
-            };
-            (
-                fallback(custom_x, "(w-text_w)/2"),
-                fallback(custom_y, "(h-text_h)/2"),
-            )
-        }
+        TextPos::CustomXY => (
+            sanitize_expr(custom_x, "(w-text_w)/2"),
+            sanitize_expr(custom_y, "(h-text_h)/2"),
+        ),
+    }
+}
+
+fn sanitize_expr(value: &str, default: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return default.to_string();
+    }
+    let valid = trimmed.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '+' | '-' | '*' | '/' | '%' | '^' | '(' | ')' | '.' | '_' | ' ')
+    });
+    if valid {
+        trimmed.to_string()
+    } else {
+        default.to_string()
     }
 }
 
@@ -138,6 +145,11 @@ mod tests {
         // Empty custom values fall back to centering instead of breaking.
         assert_eq!(
             position_expr(TextPos::CustomXY, " ", ""),
+            ("(w-text_w)/2".into(), "(h-text_h)/2".into())
+        );
+        // Disallowed injection characters fall back to default.
+        assert_eq!(
+            position_expr(TextPos::CustomXY, "10:y=20", "20;[0:v]"),
             ("(w-text_w)/2".into(), "(h-text_h)/2".into())
         );
     }
