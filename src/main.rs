@@ -1,5 +1,6 @@
 mod graph;
 mod preview;
+mod timeline;
 mod ui;
 
 fn main() -> eframe::Result<()> {

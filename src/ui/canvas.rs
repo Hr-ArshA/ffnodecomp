@@ -189,6 +189,8 @@ impl App {
                 NodeKind::Text { .. } => Color32::from_rgb(210, 120, 160),
                 NodeKind::Image { .. } => Color32::from_rgb(90, 180, 140),
                 NodeKind::SolidColor { .. } => Color32::from_rgb(180, 160, 80),
+                NodeKind::Blur { .. } => Color32::from_rgb(100, 140, 190),
+                NodeKind::Sharpen { .. } => Color32::from_rgb(195, 120, 80),
                 NodeKind::Output { .. } => Color32::from_rgb(90, 170, 110),
             };
 

@@ -42,12 +42,20 @@ pub struct Compiled {
     /// One FFmpeg input per reachable file/image source, in node order.
     pub inputs: Vec<InputSpec>,
     pub filter_complex: String,
+    /// At least one reachable source is placed on the timeline. Preview then
+    /// seeks on the *output* (after trim/setpts) instead of the input, so the
+    /// extracted frame matches sequence time rather than source time.
+    pub timeline_active: bool,
 }
 
 impl Compiled {
     /// Arguments for a single-frame preview. `t` is the seek timestamp.
     pub fn preview_args(&self, t: f32, accel: Accel) -> Vec<String> {
-        let mut args = input_args(&self.inputs, Some(t), accel);
+        // Timeline-trimmed sources are re-timed inside the filter graph, so an
+        // input-side `-ss` would seek the asset instead of the sequence. Seek
+        // the filtered output in that case.
+        let input_seek = (!self.timeline_active).then_some(t);
+        let mut args = input_args(&self.inputs, input_seek, accel);
         let filter_complex = format!(
             "{};[vout]scale={PREVIEW_W}:{PREVIEW_H}:force_original_aspect_ratio=decrease,\
              pad={PREVIEW_W}:{PREVIEW_H}:(ow-iw)/2:(oh-ih)/2:color=black,format=rgba[preview]",
@@ -59,6 +67,15 @@ impl Compiled {
                 filter_complex.as_str(),
                 "-map",
                 "[preview]",
+            ]
+            .map(String::from),
+        );
+        if self.timeline_active {
+            args.push("-ss".into());
+            args.push(format!("{t:.3}"));
+        }
+        args.extend(
+            [
                 "-frames:v",
                 "1",
                 "-f",
@@ -393,7 +410,9 @@ pub fn compile(graph: &Graph) -> Result<Compiled, String> {
             .unwrap_or_default();
 
         let filter = match &node.kind {
-            NodeKind::Input { .. } => "format=rgba,setsar=1".to_string(),
+            NodeKind::Input { .. } => {
+                format!("format=rgba,setsar=1{}", timeline_gate(graph, id))
+            }
             NodeKind::Transform {
                 width,
                 height,
@@ -469,7 +488,9 @@ pub fn compile(graph: &Graph) -> Result<Compiled, String> {
                     }
                 }
             }
-            NodeKind::Image { .. } => image::filter().to_string(),
+            NodeKind::Image { .. } => {
+                format!("{}{}", image::filter(), timeline_gate(graph, id))
+            }
             NodeKind::SolidColor {
                 color,
                 width,
@@ -500,6 +521,27 @@ pub fn compile(graph: &Graph) -> Result<Compiled, String> {
                 framerate: 30,
                 has_video,
             }),
+            NodeKind::Blur {
+                sigma,
+                sigma_v,
+                steps,
+            } => {
+                let s = sigma.clamp(0.0, 1024.0);
+                let sv = sigma_v.clamp(0.0, 1024.0);
+                let st = (*steps).clamp(1, 6);
+                format!("format=rgba,gblur=sigma={s:.2}:sigmaV={sv:.2}:steps={st},format=rgba")
+            }
+            NodeKind::Sharpen {
+                amount,
+                clarity,
+                msize_x,
+                msize_y,
+            } => {
+                let lx = crate::graph::node::odd_matrix(*msize_x);
+                let ly = crate::graph::node::odd_matrix(*msize_y);
+                let la = (amount + clarity).clamp(-2.0, 5.0);
+                format!("format=rgba,unsharp=lx={lx}:ly={ly}:la={la:.2},format=rgba")
+            }
             NodeKind::Output { .. } => return Err("internal: Output reached the filter arm".into()),
         };
 
@@ -537,10 +579,36 @@ pub fn compile(graph: &Graph) -> Result<Compiled, String> {
         return Err("could not reach an Output node".into());
     }
 
+    let timeline_active = graph.nodes.iter().any(|node| {
+        reachable.contains(&node.id)
+            && matches!(node.kind, NodeKind::Input { .. } | NodeKind::Image { .. })
+            && graph.timeline.clip_for_node(node.id).is_some()
+    });
+
     Ok(Compiled {
         inputs,
         filter_complex: filter_complex.trim_end_matches(';').to_string(),
+        timeline_active,
     })
+}
+
+/// `trim` + `setpts` suffix for a source node placed on the timeline. The
+/// returned string is empty when the node has no clip, so the compiler output
+/// stays byte-identical for graphs that never touched the timeline.
+fn timeline_gate(graph: &Graph, node_id: NodeId) -> String {
+    let timeline = &graph.timeline;
+    let Some(clip) = timeline.clip_for_node(node_id) else {
+        return String::new();
+    };
+    let fps = timeline.fps() as f64;
+    let trim_in = clip.source_trim_in as f64 / fps;
+    let source_duration = clip.source_frames() as f64 / fps;
+    let start = clip.start_frame as f64 / fps;
+    let speed = clip.speed.clamp(0.1, 10.0) as f64;
+    format!(
+        ",trim=start={trim_in:.6}:duration={source_duration:.6},\
+         setpts=(PTS-STARTPTS)/{speed:.4}+{start:.6}/TB"
+    )
 }
 
 fn emit(filter_complex: &mut String, inputs: &[String], filter: &str, outputs: &[String]) {
@@ -603,6 +671,41 @@ mod tests {
         assert!(!compiled.filter_complex.contains("split"));
         assert_eq!(compiled.inputs.len(), 1);
         assert_eq!(compiled.inputs[0].path, "/tmp/a.mp4");
+    }
+
+    #[test]
+    fn timeline_clip_trims_and_seeks_on_output() {
+        use crate::timeline::Clip;
+
+        let mut graph = Graph::default();
+        let source = graph.add_node(input(), [0.0, 0.0]);
+        let out = graph.add_node(output(640, 360), [0.0, 0.0]);
+        link(&mut graph, source, 0, out, 0);
+        graph.timeline.tracks[0].clips.push(Clip {
+            clip_id: 1,
+            node: source,
+            start_frame: 30,
+            duration_frames: 60,
+            source_trim_in: 15,
+            speed: 2.0,
+        });
+
+        let compiled = compile(&graph).expect("compiles");
+        assert!(compiled.timeline_active);
+        assert!(compiled
+            .filter_complex
+            .contains("trim=start=0.500000:duration=4.000000"));
+        assert!(compiled
+            .filter_complex
+            .contains("setpts=(PTS-STARTPTS)/2.0000+1.000000/TB"));
+
+        // A timeline-trimmed source must seek after the filter graph so `-ss`
+        // addresses sequence time, not source time.
+        let args = compiled.preview_args(1.5, Accel::Cpu);
+        let filter_at = args.iter().position(|a| a == "-filter_complex").unwrap();
+        let seek_at = args.iter().position(|a| a == "-ss").expect("output seek");
+        assert!(seek_at > filter_at);
+        assert_eq!(args[seek_at + 1], "1.500");
     }
 
     #[test]
@@ -933,6 +1036,23 @@ mod tests {
             [0.0, 0.0],
         );
         let overlay = graph.add_node(NodeKind::Overlay { x: 50, y: 50 }, [0.0, 0.0]);
+        let blur = graph.add_node(
+            NodeKind::Blur {
+                sigma: 2.0,
+                sigma_v: 2.0,
+                steps: 1,
+            },
+            [0.0, 0.0],
+        );
+        let sharpen = graph.add_node(
+            NodeKind::Sharpen {
+                amount: 1.0,
+                clarity: 0.2,
+                msize_x: 5,
+                msize_y: 5,
+            },
+            [0.0, 0.0],
+        );
         let text = graph.add_node(
             NodeKind::Text {
                 text: "Layer Test: 100%".into(),
@@ -950,7 +1070,9 @@ mod tests {
 
         link(&mut graph, bg, 0, overlay, 0);
         link(&mut graph, img, 0, overlay, 1);
-        link(&mut graph, overlay, 0, text, 0);
+        link(&mut graph, overlay, 0, blur, 0);
+        link(&mut graph, blur, 0, sharpen, 0);
+        link(&mut graph, sharpen, 0, text, 0);
         link(&mut graph, text, 0, out, 0);
 
         let compiled = compile(&graph).expect("multi-layer graph compiles");
@@ -1049,5 +1171,41 @@ mod tests {
         let compiled_mask = compile(&mask_graph).expect("compiles");
         assert!(compiled_mask.filter_complex.contains("scale2ref"));
         assert!(compiled_mask.filter_complex.contains("alphamerge"));
+    }
+
+    #[test]
+    fn blur_and_sharpen_nodes_compile_with_filters() {
+        let mut graph = Graph::default();
+        let a = graph.add_node(input(), [0.0, 0.0]);
+        let blur = graph.add_node(
+            NodeKind::Blur {
+                sigma: 4.5,
+                sigma_v: 6.0,
+                steps: 2,
+            },
+            [0.0, 0.0],
+        );
+        let sharpen = graph.add_node(
+            NodeKind::Sharpen {
+                amount: 1.2,
+                clarity: 0.3,
+                msize_x: 6, // Even number: must be forced to odd (7)
+                msize_y: 4, // Even number: must be forced to odd (5)
+            },
+            [0.0, 0.0],
+        );
+        let out = graph.add_node(output(1280, 720), [0.0, 0.0]);
+
+        link(&mut graph, a, 0, blur, 0);
+        link(&mut graph, blur, 0, sharpen, 0);
+        link(&mut graph, sharpen, 0, out, 0);
+
+        let compiled = compile(&graph).expect("graph with blur and sharpen compiles");
+        assert!(compiled
+            .filter_complex
+            .contains("gblur=sigma=4.50:sigmaV=6.00:steps=2"));
+        assert!(compiled
+            .filter_complex
+            .contains("unsharp=lx=7:ly=5:la=1.50"));
     }
 }

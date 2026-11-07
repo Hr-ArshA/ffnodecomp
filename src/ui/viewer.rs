@@ -20,17 +20,22 @@ impl App {
                     );
                 });
 
-                let mut timestamp = self.timestamp;
+                let fps = self.graph.timeline.fps();
+                let max_secs = (self.graph.timeline.duration.max(1) as f32 / fps as f32).max(0.1);
+                let mut timestamp = self.timestamp.min(max_secs);
                 if ui
                     .add(
-                        egui::Slider::new(&mut timestamp, 0.0..=120.0)
+                        egui::Slider::new(&mut timestamp, 0.0..=max_secs)
                             .text("time (s)")
                             .fixed_decimals(2),
                     )
                     .changed()
                 {
-                    self.timestamp = timestamp;
-                    self.touch();
+                    let frame = (timestamp * fps as f32).round() as u64;
+                    self.graph.timeline.playback_state = crate::timeline::PlaybackState::Paused;
+                    self.playback_anchor = None;
+                    self.graph.timeline.set_playhead(frame);
+                    self.seek_to_secs(timestamp, true);
                 }
 
                 ui.add_space(6.0);

@@ -31,6 +31,8 @@ Paste an absolute video path into the Input node, then use the timestamp slider.
   (`-loop 1 -framerate <FPS> -t <DURATION> -i <PATH>`).
 - **Solid Color**: generated background canvas via the FFmpeg `color` lavfi source filter
   (`color=c=<HEX>:s=<W>x<H>:d=<D>:r=<FPS>`).
+- **Blur**: Gaussian blur via `gblur=sigma=<H>:sigmaV=<V>:steps=<N>` with horizontal and vertical radius controls.
+- **Sharpen**: edge sharpness and clarity enhancement via `unsharp=lx=<X>:ly=<Y>:la=<AMOUNT>` with odd matrix size enforcement.
 - **Output**: sets canvas dimensions, letterboxes the incoming stream, and drives export.
 
 ### Graph & Connection Lifecycle
@@ -59,6 +61,24 @@ Paste an absolute video path into the Input node, then use the timestamp slider.
 - **GPU Acceleration**: CUDA, VAAPI, VideoToolbox, or CPU software decode/encode.
   Failed GPU calls fall back to CPU automatically and display diagnostics in the viewer panel.
 
+### Timeline
+
+- The docked timeline at the bottom is frame-accurate (`FrameIndex`), so scrubbing,
+  trimming and looping never accumulate floating-point drift.
+- **Transport**: `Play/Pause` (`Space`), step one frame (`Left`/`Right`), `Home`, and
+  `Set In` (`I`) / `Set Out` (`O`) for a loop work area. `Clear loop` removes it.
+- **Scrub**: click or drag the ruler. The playhead drives the preview timestamp,
+  cancels the in-flight extraction, and re-renders on a 33 ms debounce.
+- **Clips**: every reachable video/image source gets a clip automatically (`Sync clips`
+  re-creates missing ones). Drag the body to move, the left edge to trim in, and the
+  right edge to trim out. Magneic snapping targets the playhead, clip edges and second
+  lines; toggle it with `Snap`.
+- **Compilation**: each clip emits `trim=start=...:duration=...` plus
+  `setpts=(PTS-STARTPTS)/speed+start/TB` on its source node. Because the source is
+  re-timed inside the graph, the preview seeks on the filtered output so `-ss` means
+  sequence time.
+- **Mouse**: `Ctrl`+wheel zooms, wheel pans horizontally.
+
 ## Layout
 
 ```
@@ -67,8 +87,10 @@ src/graph/mutations.rs   edge/port disconnection, replacement, cycle guards, Edg
 src/graph/compiler.rs    reachability, topological sort, fan-out split, filter_complex generation
 src/graph/nodes/         per-node filter generators (text.rs, image.rs, solid_color.rs)
 src/preview/engine.rs    tokio FFmpeg worker, instant cancellation, GPU fallback, raw RGBA extraction
+src/timeline/mod.rs      frame-based timeline, tracks, clips, trim/snap/loop logic
 src/ui/canvas.rs         hand-rolled node canvas (wire hit tests, drag-away disconnect, port tinting)
 src/ui/viewer.rs         preview texture, timestamp, command inspector
+src/ui/timeline_view.rs  docked ruler, tracks, clips, playhead and transport
 src/ui/mod.rs            app state, graph_version monotonic counter, inspector, export thread
 ```
 
@@ -78,10 +100,18 @@ src/ui/mod.rs            app state, graph_version monotonic counter, inspector, 
 - Hardware decode flags (`-hwaccel`) apply only to video files; still image inputs are decoded in software.
 - Text escaping: emitted unquoted with individual backslash escapes for special characters and `expansion=none`.
 - Preview appends a 640x360 letterboxed scale, reads raw RGBA from stdout, and drops frames whose version is superseded.
+- Timeline clips are applied per source node (`trim` + `setpts`); overlapping clips are not composited together yet, and the timeline's audio track is a placeholder.
 
 ## Deliberate MVP limitations
 
 - GPU acceleration is decode/encode only. Filter graph execution runs on the CPU
   because `-hwaccel_output_format` would break `eq`, `pad`, and `overlay`.
-- Audio ports exist in the type system but no MVP node produces audio.
+- Audio ports exist in the type system but no MVP node produces audio, so the
+  audio track is empty.
 - One Output node drives the render. Extra Output nodes are ignored.
+- An `Input` clip is seeded with a 5 s default length until the file is probed;
+  drag its right edge to match the real duration. An image clip uses the node's
+  configured duration.
+- One clip per source node, and clips are not yet blended with each other. A
+  timeline-trimmed source only exists between its start and end, so previewing
+  a gap before a delayed clip returns no frame.

@@ -1,4 +1,5 @@
 mod canvas;
+mod timeline_view;
 mod viewer;
 
 use std::sync::mpsc::{channel, Receiver};
@@ -9,8 +10,12 @@ use eframe::egui;
 use crate::graph::compiler::{self, command_line, Compiled};
 use crate::graph::node::{demo_graph, hex_color, Graph, KeyMode, NodeId, NodeKind, TextPos};
 use crate::preview::engine::{self, Accel, PreviewEngine, PreviewMsg};
+use timeline_view::TimelineDrag;
 
 const DEBOUNCE: Duration = Duration::from_millis(80);
+/// Scrubbing and clip drags should feel live; the extraction itself is the
+/// real frame budget.
+const SCRUB_DEBOUNCE: Duration = Duration::from_millis(33);
 const GRAPH_FILE: &str = "graph.json";
 const EXPORT_FILE: &str = "export.mp4";
 
@@ -51,16 +56,25 @@ pub struct App {
     export_path: String,
     export_progress: f32,
     export_rx: Option<Receiver<engine::ExportMsg>>,
+
+    /// Debounce length is switched by `seek`/`touch`: scrubs fire faster than
+    /// graph edits.
+    debounce: Duration,
+    timeline_drag: Option<TimelineDrag>,
+    /// Wall-clock anchor `(started_at, frame_at_start)` for playback, so the
+    /// playhead does not drift when extraction is slower than real time.
+    playback_anchor: Option<(Instant, u64)>,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
-        let graph = std::fs::read_to_string(GRAPH_FILE)
+        let mut graph = std::fs::read_to_string(GRAPH_FILE)
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_else(demo_graph);
+        graph.timeline.repair(graph.nodes.len());
 
         let (engine, status) = match PreviewEngine::new() {
             Ok(engine) => (Some(engine), None),
@@ -89,17 +103,57 @@ impl App {
             export_path: EXPORT_FILE.to_string(),
             export_progress: 0.0,
             export_rx: None,
+            debounce: DEBOUNCE,
+            timeline_drag: None,
+            playback_anchor: None,
         }
     }
 
     fn touch(&mut self) {
         self.graph_version += 1;
+        self.debounce = DEBOUNCE;
         self.dirty_at = Some(Instant::now());
         self.preview_pending = false;
         // Kill the in-flight FFmpeg immediately; the debounced re-plan below
         // starts a fresh extraction for the new topology.
         if let Some(engine) = &mut self.engine {
             engine.cancel();
+        }
+    }
+
+    /// Timeline edits and scrubbing change the requested timestamp too, so the
+    /// generation must move or a late frame for the old time would be shown.
+    /// Only the first event of a burst schedules a re-plan; later events ride
+    /// the 33 ms window instead of pushing it back.
+    fn touch_throttled(&mut self) {
+        self.graph_version += 1;
+        self.preview_pending = false;
+        if let Some(engine) = &mut self.engine {
+            engine.cancel();
+        }
+        if self.dirty_at.is_none() {
+            self.debounce = SCRUB_DEBOUNCE;
+            self.dirty_at = Some(Instant::now());
+        }
+    }
+
+    /// Seek the preview clock. Scrubbing cancels the in-flight frame; playback
+    /// does not, otherwise a render slower than real time would never finish.
+    fn seek_to_secs(&mut self, secs: f32, cancel: bool) {
+        self.timestamp = secs.max(0.0);
+        if self.dirty_at.is_some() && !cancel {
+            return;
+        }
+        self.debounce = SCRUB_DEBOUNCE;
+        if self.dirty_at.is_none() {
+            self.dirty_at = Some(Instant::now());
+        }
+        if cancel {
+            self.graph_version += 1;
+            self.preview_pending = false;
+            if let Some(engine) = &mut self.engine {
+                engine.cancel();
+            }
         }
     }
 
@@ -198,6 +252,7 @@ impl App {
         ];
         self.selected = Some(self.graph.add_node(kind, pos));
         self.selected_edge = None;
+        self.graph.sync_timeline_clips();
         self.touch();
     }
 
@@ -383,6 +438,22 @@ impl App {
                                 height: 720,
                                 duration: 5.0,
                                 framerate: 30,
+                            });
+                        }
+                        if ui.button("Blur").clicked() {
+                            self.add_node(NodeKind::Blur {
+                                sigma: 3.0,
+                                sigma_v: 3.0,
+                                steps: 1,
+                            });
+                        }
+                        ui.end_row();
+                        if ui.button("Sharpen").clicked() {
+                            self.add_node(NodeKind::Sharpen {
+                                amount: 1.0,
+                                clarity: 0.0,
+                                msize_x: 5,
+                                msize_y: 5,
                             });
                         }
                         ui.end_row();
@@ -756,6 +827,70 @@ impl App {
                             .weak(),
                     );
                 }
+                NodeKind::Blur {
+                    sigma,
+                    sigma_v,
+                    steps,
+                } => {
+                    changed |= ui
+                        .add(egui::Slider::new(sigma, 0.0..=100.0).text("Horizontal radius"))
+                        .changed();
+                    changed |= ui
+                        .add(egui::Slider::new(sigma_v, 0.0..=100.0).text("Vertical radius"))
+                        .changed();
+                    changed |= ui
+                        .add(egui::Slider::new(steps, 1..=6).text("Steps"))
+                        .changed();
+                    ui.label(
+                        egui::RichText::new("Gaussian blur via gblur=sigma:sigmaV:steps")
+                            .small()
+                            .weak(),
+                    );
+                }
+                NodeKind::Sharpen {
+                    amount,
+                    clarity,
+                    msize_x,
+                    msize_y,
+                } => {
+                    changed |= ui
+                        .add(egui::Slider::new(amount, -2.0..=5.0).text("Edge sharpness"))
+                        .changed();
+                    changed |= ui
+                        .add(egui::Slider::new(clarity, -2.0..=5.0).text("Clarity amount"))
+                        .changed();
+                    egui::Grid::new("sharpen_matrix_grid")
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            ui.label("Matrix size X");
+                            let mut x = *msize_x;
+                            if ui
+                                .add(egui::DragValue::new(&mut x).range(3..=23).speed(2))
+                                .changed()
+                            {
+                                *msize_x = crate::graph::node::odd_matrix(x);
+                                changed = true;
+                            }
+                            ui.end_row();
+                            ui.label("Matrix size Y");
+                            let mut y = *msize_y;
+                            if ui
+                                .add(egui::DragValue::new(&mut y).range(3..=23).speed(2))
+                                .changed()
+                            {
+                                *msize_y = crate::graph::node::odd_matrix(y);
+                                changed = true;
+                            }
+                            ui.end_row();
+                        });
+                    ui.label(
+                        egui::RichText::new(
+                            "Sharpening via unsharp=lx:ly:la (matrix sizes must be odd 3..23)",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
                 NodeKind::Output { width, height } => {
                     egui::Grid::new("output_grid")
                         .num_columns(2)
@@ -825,7 +960,7 @@ impl App {
                 graph
                     .links
                     .retain(|link| link.from < graph.nodes.len() && link.to < graph.nodes.len());
-
+                graph.timeline.repair(graph.nodes.len());
                 self.graph = graph;
                 self.selected = None;
                 self.selected_edge = None;
@@ -933,26 +1068,34 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.poll_preview(&ctx);
         self.poll_export();
+        self.handle_timeline_keys(&ctx);
+        self.advance_playback(&ctx);
 
         if let Some(changed_at) = self.dirty_at {
             let elapsed = changed_at.elapsed();
-            if elapsed >= DEBOUNCE {
+            if elapsed >= self.debounce {
                 self.dirty_at = None;
                 self.refresh_preview();
             } else {
-                ctx.request_repaint_after(DEBOUNCE - elapsed);
+                ctx.request_repaint_after(self.debounce - elapsed);
             }
         }
 
         self.top_bar(ui);
         self.left_panel(ui);
         self.viewer(ui);
+        self.timeline(ui);
         egui::CentralPanel::default().show(ui, |ui| {
             self.canvas(ui);
         });
 
         if self.preview_pending {
             ctx.request_repaint_after(Duration::from_millis(30));
+        }
+        // A scrub handled while drawing the timeline schedules a refresh after
+        // the debounce check has already run this frame.
+        if self.dirty_at.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(16));
         }
         if self.export_rx.is_some() {
             ctx.request_repaint_after(Duration::from_millis(50));

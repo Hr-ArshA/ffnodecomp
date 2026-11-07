@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::timeline::TimelineState;
+
 /// Nodes are addressed by index. Removal renumbers links, so ids stay durable
 /// only while the graph is alive (and across save/load, since order is stable).
 pub type NodeId = usize;
@@ -175,10 +177,31 @@ pub enum NodeKind {
         duration: f32,
         framerate: u32,
     },
+    Blur {
+        sigma: f32,
+        sigma_v: f32,
+        steps: u32,
+    },
+    Sharpen {
+        amount: f32,
+        clarity: f32,
+        msize_x: u32,
+        msize_y: u32,
+    },
     Output {
         width: u32,
         height: u32,
     },
+}
+
+/// Clamps to [3, 23] and forces an odd integer for FFmpeg unsharp matrix sizes.
+pub fn odd_matrix(n: u32) -> u32 {
+    let n = n.clamp(3, 23);
+    if n.is_multiple_of(2) {
+        n.saturating_add(1).min(23)
+    } else {
+        n
+    }
 }
 
 /// `#RRGGBB` for display; FFmpeg wants `0xRRGGBB`.
@@ -212,6 +235,8 @@ impl NodeKind {
             NodeKind::Text { .. } => "Text",
             NodeKind::Image { .. } => "Image",
             NodeKind::SolidColor { .. } => "Solid Color",
+            NodeKind::Blur { .. } => "Blur",
+            NodeKind::Sharpen { .. } => "Sharpen",
             NodeKind::Output { .. } => "Output",
         }
     }
@@ -287,6 +312,20 @@ impl NodeKind {
                 height,
                 ..
             } => format!("{} {width}x{height}", hex_color(*color)),
+            NodeKind::Blur {
+                sigma,
+                sigma_v,
+                steps,
+            } => format!("H {sigma:.1}  V {sigma_v:.1}  s{steps}"),
+            NodeKind::Sharpen {
+                amount,
+                clarity,
+                msize_x,
+                msize_y,
+            } => {
+                let la = amount + clarity;
+                format!("la {la:+.2}  {msize_x}x{msize_y}")
+            }
             NodeKind::Output { width, height } => format!("canvas {width}x{height}"),
         }
     }
@@ -312,6 +351,10 @@ pub struct Link {
 pub struct Graph {
     pub nodes: Vec<Node>,
     pub links: Vec<Link>,
+    /// Saved with the graph so clips survive a reload. Older graph.json files
+    /// simply get the default empty timeline.
+    #[serde(default)]
+    pub timeline: TimelineState,
 }
 
 impl Graph {
@@ -388,7 +431,33 @@ impl Graph {
         for (index, node) in self.nodes.iter_mut().enumerate() {
             node.id = index;
         }
+        self.timeline.on_node_removed(id);
     }
+
+    /// Place every source node that has no clip yet. Used by the demo graph and
+    /// the "Sync clips" button; deleting a clip is otherwise respected.
+    pub fn sync_timeline_clips(&mut self) {
+        let fps = self.timeline.fps();
+        let sources: Vec<(NodeId, u64)> = self
+            .nodes
+            .iter()
+            .filter_map(|node| natural_frames(&node.kind, fps).map(|frames| (node.id, frames)))
+            .collect();
+        self.timeline.sync_sources(&sources);
+    }
+}
+
+/// Default timeline length for a source node, in frames. Only sources the
+/// compiler can trim are placed automatically; a Text node over video would
+/// otherwise shorten the whole composition to its own duration.
+fn natural_frames(kind: &NodeKind, fps: u32) -> Option<u64> {
+    let secs = match kind {
+        // ponytail: fixed guess until the UI probes the file with ffprobe.
+        NodeKind::Input { .. } => 5.0,
+        NodeKind::Image { duration, .. } => *duration,
+        _ => return None,
+    };
+    Some(((secs.max(0.1) * fps as f32).round() as u64).max(1))
 }
 
 /// Small starter graph so the editor is not a blank page. The Input path is
@@ -429,6 +498,7 @@ pub fn demo_graph() -> Graph {
     let _ = graph.connect(input, 0, transform, 0);
     let _ = graph.connect(transform, 0, color, 0);
     let _ = graph.connect(color, 0, output, 0);
+    graph.sync_timeline_clips();
     graph
 }
 
@@ -475,5 +545,18 @@ mod tests {
             graph.connect(out, 0, a, 0).is_err(),
             "Output has no output port"
         );
+    }
+
+    #[test]
+    fn odd_matrix_clamps_and_forces_odd() {
+        assert_eq!(odd_matrix(0), 3);
+        assert_eq!(odd_matrix(2), 3);
+        assert_eq!(odd_matrix(3), 3);
+        assert_eq!(odd_matrix(4), 5);
+        assert_eq!(odd_matrix(5), 5);
+        assert_eq!(odd_matrix(22), 23);
+        assert_eq!(odd_matrix(23), 23);
+        assert_eq!(odd_matrix(24), 23);
+        assert_eq!(odd_matrix(100), 23);
     }
 }
