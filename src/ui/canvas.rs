@@ -191,6 +191,10 @@ impl App {
                 NodeKind::SolidColor { .. } => Color32::from_rgb(180, 160, 80),
                 NodeKind::Blur { .. } => Color32::from_rgb(100, 140, 190),
                 NodeKind::Sharpen { .. } => Color32::from_rgb(195, 120, 80),
+                NodeKind::Lut3d { .. } => Color32::from_rgb(150, 120, 200),
+                NodeKind::ColorBalance { .. } => Color32::from_rgb(200, 150, 90),
+                NodeKind::Levels { .. } => Color32::from_rgb(120, 175, 200),
+                NodeKind::InvertSolarize { .. } => Color32::from_rgb(200, 100, 130),
                 NodeKind::Output { .. } => Color32::from_rgb(90, 170, 110),
             };
 

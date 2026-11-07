@@ -33,6 +33,10 @@ Paste an absolute video path into the Input node, then use the timestamp slider.
   (`color=c=<HEX>:s=<W>x<H>:d=<D>:r=<FPS>`).
 - **Blur**: Gaussian blur via `gblur=sigma=<H>:sigmaV=<V>:steps=<N>` with horizontal and vertical radius controls.
 - **Sharpen**: edge sharpness and clarity enhancement via `unsharp=lx=<X>:ly=<Y>:la=<AMOUNT>` with odd matrix size enforcement.
+- **3D LUT**: drops a cinematic `.cube` / `.3dl` preset onto the stream via `lut3d=file=...`; an empty path is an identity pass.
+- **Color Balance**: separate Lift (shadows), Gamma (midtones), and Gain (highlights) RGB sliders mapped to `colorbalance`.
+- **Levels**: per-channel black point, white point, and gamma via `colorlevels` + `eq=gamma_r/g/b`; an approximate histogram placeholder is shown in the inspector.
+- **Invert / Solarize**: invert amounts map to `negate` (full) or a `lutrgb` blend (partial); solarisation inverts values above a threshold, also by amount.
 - **Output**: sets canvas dimensions, letterboxes the incoming stream, and drives export.
 
 ### Graph & Connection Lifecycle

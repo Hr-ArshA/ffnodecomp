@@ -542,6 +542,77 @@ pub fn compile(graph: &Graph) -> Result<Compiled, String> {
                 let la = (amount + clarity).clamp(-2.0, 5.0);
                 format!("format=rgba,unsharp=lx={lx}:ly={ly}:la={la:.2},format=rgba")
             }
+            NodeKind::Lut3d { path } => {
+                if path.trim().is_empty() {
+                    // No LUT chosen yet: an identity pass, not a compile error.
+                    "format=rgba".to_string()
+                } else {
+                    format!("format=rgba,lut3d=file={},format=rgba", escape_lut_path(path))
+                }
+            }
+            NodeKind::ColorBalance {
+                shadows,
+                midtones,
+                highlights,
+            } => {
+                let s = shadows.map(|value| value.clamp(-1.0, 1.0));
+                let m = midtones.map(|value| value.clamp(-1.0, 1.0));
+                let h = highlights.map(|value| value.clamp(-1.0, 1.0));
+                format!(
+                    "format=rgba,colorbalance=rs={:.3}:gs={:.3}:bs={:.3}:\
+                     rm={:.3}:gm={:.3}:bm={:.3}:rh={:.3}:gh={:.3}:bh={:.3},format=rgba",
+                    s[0], s[1], s[2], m[0], m[1], m[2], h[0], h[1], h[2]
+                )
+            }
+            NodeKind::Levels {
+                black,
+                white,
+                gamma,
+            } => {
+                // colorlevels rejects an inverted range, so clamp each pair
+                // before handing it to FFmpeg.
+                let lo = black.map(|value| value.clamp(0.0, 0.999));
+                let hi = [
+                    white[0].clamp(lo[0] + 0.001, 1.0),
+                    white[1].clamp(lo[1] + 0.001, 1.0),
+                    white[2].clamp(lo[2] + 0.001, 1.0),
+                ];
+                let g = gamma.map(|value| value.clamp(0.1, 10.0));
+                format!(
+                    "format=rgba,colorlevels=rimin={:.4}:gimin={:.4}:bimin={:.4}:\
+                     rimax={:.4}:gimax={:.4}:bimax={:.4},\
+                     eq=gamma_r={:.4}:gamma_g={:.4}:gamma_b={:.4},format=rgba",
+                    lo[0], lo[1], lo[2], hi[0], hi[1], hi[2], g[0], g[1], g[2]
+                )
+            }
+            NodeKind::InvertSolarize {
+                invert,
+                solarize,
+                threshold,
+            } => {
+                let invert = invert.clamp(0.0, 1.0);
+                let solarize = solarize.clamp(0.0, 1.0);
+                let threshold = threshold.clamp(0.0, 1.0) * 255.0;
+                let mut filters = String::from("format=rgba");
+                if invert >= 0.999 {
+                    filters.push_str(",negate");
+                } else if invert > 0.0005 {
+                    // Blend toward the negated value instead of a hard flip.
+                    let expr = format!("clip(val+{invert:.4}*(255-2*val),0,255)");
+                    filters.push_str(&format!(
+                        ",lutrgb=r='{expr}':g='{expr}':b='{expr}'"
+                    ));
+                }
+                if solarize > 0.0005 {
+                    let expr =
+                        format!("clip(val+{solarize:.4}*(255-2*val)*gte(val,{threshold:.2}),0,255)");
+                    filters.push_str(&format!(
+                        ",lutrgb=r='{expr}':g='{expr}':b='{expr}'"
+                    ));
+                }
+                filters.push_str(",format=rgba");
+                filters
+            }
             NodeKind::Output { .. } => return Err("internal: Output reached the filter arm".into()),
         };
 
@@ -609,6 +680,27 @@ fn timeline_gate(graph: &Graph, node_id: NodeId) -> String {
         ",trim=start={trim_in:.6}:duration={source_duration:.6},\
          setpts=(PTS-STARTPTS)/{speed:.4}+{start:.6}/TB"
     )
+}
+
+/// Escape a LUT path for a filter option value. The filtergraph and the
+/// option parser each consume one level of backslashes, so characters that
+/// would split the option or graph need two (quotes three, backslashes four).
+/// Spaces survive unquoted because the whole graph is one argv entry.
+fn escape_lut_path(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len() + 8);
+    for ch in path.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\\\\\"),
+            '\'' => escaped.push_str("\\\\\\'"),
+            ':' => escaped.push_str("\\\\:"),
+            ',' | '[' | ']' | ';' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn emit(filter_complex: &mut String, inputs: &[String], filter: &str, outputs: &[String]) {
@@ -1207,5 +1299,179 @@ mod tests {
         assert!(compiled
             .filter_complex
             .contains("unsharp=lx=7:ly=5:la=1.50"));
+    }
+
+    #[test]
+    fn color_effect_nodes_compile_with_filters() {
+        let mut graph = Graph::default();
+        let a = graph.add_node(input(), [0.0, 0.0]);
+        let balance = graph.add_node(
+            NodeKind::ColorBalance {
+                shadows: [-0.2, 0.1, 0.25],
+                midtones: [0.0, 0.0, 0.0],
+                highlights: [0.3, -0.1, 0.0],
+            },
+            [0.0, 0.0],
+        );
+        let levels = graph.add_node(
+            NodeKind::Levels {
+                black: [0.05, 0.0, 0.1],
+                white: [0.95, 1.0, 0.8],
+                gamma: [1.2, 1.0, 0.8],
+            },
+            [0.0, 0.0],
+        );
+        let fx = graph.add_node(
+            NodeKind::InvertSolarize {
+                invert: 0.5,
+                solarize: 0.5,
+                threshold: 0.5,
+            },
+            [0.0, 0.0],
+        );
+        let lut = graph.add_node(
+            NodeKind::Lut3d {
+                path: "/tmp/luts/teal's:look.cube".into(),
+            },
+            [0.0, 0.0],
+        );
+        let out = graph.add_node(output(1280, 720), [0.0, 0.0]);
+        link(&mut graph, a, 0, balance, 0);
+        link(&mut graph, balance, 0, levels, 0);
+        link(&mut graph, levels, 0, fx, 0);
+        link(&mut graph, fx, 0, lut, 0);
+        link(&mut graph, lut, 0, out, 0);
+
+        let compiled = compile(&graph).expect("colour nodes compile");
+        let chain = &compiled.filter_complex;
+        assert!(chain.contains(
+            "colorbalance=rs=-0.200:gs=0.100:bs=0.250:rm=0.000:gm=0.000:bm=0.000:\
+             rh=0.300:gh=-0.100:bh=0.000"
+        ));
+        assert!(chain.contains(
+            "colorlevels=rimin=0.0500:gimin=0.0000:bimin=0.1000:\
+             rimax=0.9500:gimax=1.0000:bimax=0.8000"
+        ));
+        assert!(chain.contains("eq=gamma_r=1.2000:gamma_g=1.0000:gamma_b=0.8000"));
+        assert!(chain.contains("lutrgb=r='clip(val+0.5000*(255-2*val),0,255)'"));
+        assert!(chain.contains("gte(val,127.50)"));
+        assert!(chain.contains("lut3d=file=/tmp/luts/teal"));
+    }
+
+    #[test]
+    fn lut_path_escapes_filtergraph_separators() {
+        assert_eq!(escape_lut_path("/plain path/x.cube"), "/plain path/x.cube");
+        assert_eq!(escape_lut_path("a:b"), "a\\\\:b");
+        assert_eq!(escape_lut_path("it's"), "it\\\\\\'s");
+        assert_eq!(escape_lut_path("a\\b"), "a\\\\\\\\b");
+        assert_eq!(escape_lut_path("a,b[1];c"), "a\\,b\\[1\\]\\;c");
+    }
+
+    #[test]
+    fn neutral_color_nodes_are_identity() {
+        let mut graph = Graph::default();
+        let a = graph.add_node(input(), [0.0, 0.0]);
+        let lut = graph.add_node(NodeKind::Lut3d { path: "  ".into() }, [0.0, 0.0]);
+        let fx = graph.add_node(
+            NodeKind::InvertSolarize {
+                invert: 0.0,
+                solarize: 0.0,
+                threshold: 0.5,
+            },
+            [0.0, 0.0],
+        );
+        let out = graph.add_node(output(640, 360), [0.0, 0.0]);
+        link(&mut graph, a, 0, lut, 0);
+        link(&mut graph, lut, 0, fx, 0);
+        link(&mut graph, fx, 0, out, 0);
+
+        let compiled = compile(&graph).expect("identity colour nodes compile");
+        assert!(!compiled.filter_complex.contains("lut3d"));
+        assert!(!compiled.filter_complex.contains("lutrgb"));
+        assert!(!compiled.filter_complex.contains("negate"));
+    }
+
+    #[test]
+    fn color_nodes_render_with_real_ffmpeg() {
+        if std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+
+        let lut_path = std::env::temp_dir().join("ffnodecomp it's:lut.cube");
+        let cube = "TITLE \"identity\"\nLUT_3D_SIZE 2\n\
+                    0.0 0.0 0.0\n1.0 0.0 0.0\n0.0 1.0 0.0\n1.0 1.0 0.0\n\
+                    0.0 0.0 1.0\n1.0 0.0 1.0\n0.0 1.0 1.0\n1.0 1.0 1.0\n";
+        if std::fs::write(&lut_path, cube).is_err() {
+            return;
+        }
+
+        let mut graph = Graph::default();
+        let bg = graph.add_node(
+            NodeKind::SolidColor {
+                color: [40, 80, 120],
+                width: 640,
+                height: 360,
+                duration: 1.0,
+                framerate: 30,
+            },
+            [0.0, 0.0],
+        );
+        let balance = graph.add_node(
+            NodeKind::ColorBalance {
+                shadows: [0.1, -0.1, 0.0],
+                midtones: [0.0, 0.1, -0.1],
+                highlights: [0.05, 0.0, 0.1],
+            },
+            [0.0, 0.0],
+        );
+        let levels = graph.add_node(
+            NodeKind::Levels {
+                black: [0.02, 0.0, 0.05],
+                white: [0.95, 1.0, 0.9],
+                gamma: [1.1, 0.9, 1.0],
+            },
+            [0.0, 0.0],
+        );
+        let fx = graph.add_node(
+            NodeKind::InvertSolarize {
+                invert: 0.25,
+                solarize: 0.25,
+                threshold: 0.6,
+            },
+            [0.0, 0.0],
+        );
+        let lut = graph.add_node(
+            NodeKind::Lut3d {
+                path: lut_path.to_string_lossy().into_owned(),
+            },
+            [0.0, 0.0],
+        );
+        let out = graph.add_node(output(640, 360), [0.0, 0.0]);
+        link(&mut graph, bg, 0, balance, 0);
+        link(&mut graph, balance, 0, levels, 0);
+        link(&mut graph, levels, 0, fx, 0);
+        link(&mut graph, fx, 0, lut, 0);
+        link(&mut graph, lut, 0, out, 0);
+
+        let compiled = compile(&graph).expect("colour chain compiles");
+        let args = compiled.preview_args(0.2, Accel::Cpu);
+        let proc = std::process::Command::new("ffmpeg")
+            .args(&args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .expect("ffmpeg executes");
+        let _ = std::fs::remove_file(&lut_path);
+
+        assert!(
+            proc.status.success(),
+            "ffmpeg failed: {}",
+            String::from_utf8_lossy(&proc.stderr)
+        );
+        assert_eq!(proc.stdout.len(), 640 * 360 * 4);
     }
 }

@@ -188,6 +188,28 @@ pub enum NodeKind {
         msize_x: u32,
         msize_y: u32,
     },
+    /// Cinematic 3D LUT (`.cube` / `.3dl`). Empty path is a no-op.
+    Lut3d {
+        path: String,
+    },
+    /// Lift / gamma / gain, stored as RGB triplets in -1..1.
+    ColorBalance {
+        shadows: [f32; 3],
+        midtones: [f32; 3],
+        highlights: [f32; 3],
+    },
+    /// Per-channel input black/white points and gamma.
+    Levels {
+        black: [f32; 3],
+        white: [f32; 3],
+        gamma: [f32; 3],
+    },
+    /// Partial colour inversion and threshold solarisation.
+    InvertSolarize {
+        invert: f32,
+        solarize: f32,
+        threshold: f32,
+    },
     Output {
         width: u32,
         height: u32,
@@ -237,6 +259,10 @@ impl NodeKind {
             NodeKind::SolidColor { .. } => "Solid Color",
             NodeKind::Blur { .. } => "Blur",
             NodeKind::Sharpen { .. } => "Sharpen",
+            NodeKind::Lut3d { .. } => "3D LUT",
+            NodeKind::ColorBalance { .. } => "Color Balance",
+            NodeKind::Levels { .. } => "Levels",
+            NodeKind::InvertSolarize { .. } => "Invert / Solarize",
             NodeKind::Output { .. } => "Output",
         }
     }
@@ -326,6 +352,38 @@ impl NodeKind {
                 let la = amount + clarity;
                 format!("la {la:+.2}  {msize_x}x{msize_y}")
             }
+            NodeKind::Lut3d { path } => file_label(path),
+            NodeKind::ColorBalance {
+                shadows,
+                midtones,
+                highlights,
+            } => {
+                let avg = |v: &[f32; 3]| (v[0] + v[1] + v[2]) / 3.0;
+                format!(
+                    "L {:+.2}  M {:+.2}  H {:+.2}",
+                    avg(shadows),
+                    avg(midtones),
+                    avg(highlights)
+                )
+            }
+            NodeKind::Levels {
+                black,
+                white,
+                gamma,
+            } => {
+                let avg = |v: &[f32; 3]| (v[0] + v[1] + v[2]) / 3.0;
+                format!(
+                    "b {:.2}  w {:.2}  g {:.2}",
+                    avg(black),
+                    avg(white),
+                    avg(gamma)
+                )
+            }
+            NodeKind::InvertSolarize {
+                invert,
+                solarize,
+                threshold,
+            } => format!("inv {invert:.2}  sol {solarize:.2}  t {threshold:.2}"),
             NodeKind::Output { width, height } => format!("canvas {width}x{height}"),
         }
     }

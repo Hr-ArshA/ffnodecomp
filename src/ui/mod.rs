@@ -456,6 +456,34 @@ impl App {
                                 msize_y: 5,
                             });
                         }
+                        if ui.button("3D LUT").clicked() {
+                            self.add_node(NodeKind::Lut3d {
+                                path: String::new(),
+                            });
+                        }
+                        ui.end_row();
+                        if ui.button("Color Balance").clicked() {
+                            self.add_node(NodeKind::ColorBalance {
+                                shadows: [0.0; 3],
+                                midtones: [0.0; 3],
+                                highlights: [0.0; 3],
+                            });
+                        }
+                        if ui.button("Levels").clicked() {
+                            self.add_node(NodeKind::Levels {
+                                black: [0.0; 3],
+                                white: [1.0; 3],
+                                gamma: [1.0; 3],
+                            });
+                        }
+                        ui.end_row();
+                        if ui.button("Invert / Solarize").clicked() {
+                            self.add_node(NodeKind::InvertSolarize {
+                                invert: 0.0,
+                                solarize: 0.0,
+                                threshold: 0.5,
+                            });
+                        }
                         ui.end_row();
                     });
 
@@ -891,6 +919,93 @@ impl App {
                         .weak(),
                     );
                 }
+                NodeKind::Lut3d { path } => {
+                    ui.label("3D LUT file (.cube / .3dl)");
+                    ui.horizontal(|ui| {
+                        changed |= ui.text_edit_singleline(path).changed();
+                        if ui.button("Browse...").clicked() {
+                            let mut dialog =
+                                rfd::FileDialog::new().add_filter("3D LUT", &["cube", "3dl"]);
+                            if let Some(parent) = std::path::Path::new(path).parent() {
+                                if parent.exists() && parent != std::path::Path::new("") {
+                                    dialog = dialog.set_directory(parent);
+                                }
+                            }
+                            if let Some(file) = dialog.pick_file() {
+                                *path = file.to_string_lossy().into_owned();
+                                changed = true;
+                            }
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "Cinematic preset via lut3d=file=...; an empty path is an identity pass.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+                NodeKind::ColorBalance {
+                    shadows,
+                    midtones,
+                    highlights,
+                } => {
+                    for (label, values) in [
+                        ("Shadows (Lift)", shadows),
+                        ("Midtones (Gamma)", midtones),
+                        ("Highlights (Gain)", highlights),
+                    ] {
+                        ui.label(egui::RichText::new(label).strong());
+                        changed |= rgb_sliders(ui, label, values, -1.0..=1.0, 2);
+                        ui.add_space(4.0);
+                    }
+                    ui.label(
+                        egui::RichText::new("colorbalance=rs:gs:bs:rm:gm:bm:rh:gh:bh")
+                            .small()
+                            .weak(),
+                    );
+                }
+                NodeKind::Levels {
+                    black,
+                    white,
+                    gamma,
+                } => {
+                    ui.label(egui::RichText::new("Black point").strong());
+                    changed |= rgb_sliders(ui, "levels_black", black, 0.0..=1.0, 3);
+                    ui.label(egui::RichText::new("White point").strong());
+                    changed |= rgb_sliders(ui, "levels_white", white, 0.0..=1.0, 3);
+                    ui.label(egui::RichText::new("Gamma").strong());
+                    changed |= rgb_sliders(ui, "levels_gamma", gamma, 0.1..=10.0, 2);
+                    ui.label(
+                        egui::RichText::new(
+                            "Histogram placeholder (not sampled yet). Maps to colorlevels + eq gamma.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+                NodeKind::InvertSolarize {
+                    invert,
+                    solarize,
+                    threshold,
+                } => {
+                    changed |= ui
+                        .add(egui::Slider::new(invert, 0.0..=1.0).text("Invert amount"))
+                        .changed();
+                    changed |= ui
+                        .add(egui::Slider::new(solarize, 0.0..=1.0).text("Solarize amount"))
+                        .changed();
+                    changed |= ui
+                        .add(egui::Slider::new(threshold, 0.0..=1.0).text("Solarize threshold"))
+                        .changed();
+                    ui.label(
+                        egui::RichText::new(
+                            "Full invert uses negate; partial amounts use lutrgb blends.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
                 NodeKind::Output { width, height } => {
                     egui::Grid::new("output_grid")
                         .num_columns(2)
@@ -1061,6 +1176,31 @@ impl App {
             },
         }
     }
+}
+
+/// R/G/B slider grid shared by Color Balance and Levels. `id` must be unique
+/// per visible grid, otherwise egui reuses the wrong layout state.
+fn rgb_sliders(
+    ui: &mut egui::Ui,
+    id: &str,
+    values: &mut [f32; 3],
+    range: std::ops::RangeInclusive<f32>,
+    decimals: usize,
+) -> bool {
+    let mut changed = false;
+    egui::Grid::new(id)
+        .num_columns(2)
+        .spacing([8.0, 2.0])
+        .show(ui, |ui| {
+            for (label, value) in ["R", "G", "B"].into_iter().zip(values.iter_mut()) {
+                ui.label(label);
+                changed |= ui
+                    .add(egui::Slider::new(value, range.clone()).fixed_decimals(decimals))
+                    .changed();
+                ui.end_row();
+            }
+        });
+    changed
 }
 
 impl eframe::App for App {
