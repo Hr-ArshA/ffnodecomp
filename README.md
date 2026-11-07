@@ -4,6 +4,8 @@ Minimal node-based video compositor: an egui graph editor that compiles to an
 FFmpeg `-filter_complex` command, renders a single-frame preview asynchronously,
 and exports an H.264 MP4.
 
+![cover](./assets/img/cover.png)
+
 ## Run
 
 ```sh
@@ -12,6 +14,21 @@ cargo run --release
 
 Requires `ffmpeg` on `PATH`. On first launch a small demo graph is created.
 Paste an absolute video path into the Input node, then use the timestamp slider.
+
+## Documentation
+
+Full documentation lives in the [`docs/`](docs/README.md) folder:
+
+| Guide | Description |
+| --- | --- |
+| [**User Guide**](docs/user-guide.md) | Canvas editing, keyboard shortcuts, inspector, preview, export |
+| [**Nodes Reference**](docs/nodes.md) | Every node kind, ports, parameter ranges, exact FFmpeg filters |
+| [**Timeline**](docs/timeline.md) | Data model, trimming, snapping, transport, compilation to `trim`/`setpts` |
+| [**Compilation**](docs/compilation.md) | Graph validation, topological sort, fan-out split, argument assembly, escaping |
+| [**Architecture**](docs/architecture.md) | Module map, app state, Tokio preview engine, export thread, persistence |
+| [**Graph Format**](docs/graph-format.md) | `graph.json` schema, enum values, repair rules, safe hand-editing |
+| [**Development**](docs/development.md) | Build/test/lint commands, adding a new node, CI/release workflow |
+| [**Troubleshooting & FAQ**](docs/troubleshooting.md) | Solutions for common errors, LUT/font gotchas, performance, FAQ |
 
 ### Nodes
 
