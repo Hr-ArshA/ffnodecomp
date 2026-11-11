@@ -1,4 +1,5 @@
 /target
+/dist
 /graph.json
 /export.mp4
 /session-*.md

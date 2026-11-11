@@ -1064,10 +1064,15 @@ name = "ffnodecomp"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "js-sys",
  "rfd",
  "serde",
  "serde_json",
  "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
 ]
 
 [[package]]

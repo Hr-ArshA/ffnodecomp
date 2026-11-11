@@ -2,11 +2,14 @@
 
 Minimal node-based video compositor: an egui graph editor that compiles to an
 FFmpeg `-filter_complex` command, renders a single-frame preview asynchronously,
-and exports an H.264 MP4.
+and exports an H.264 MP4. Runs as a native desktop app or in the browser via
+WebAssembly + `ffmpeg.wasm`.
 
 ![cover](./assets/img/cover.png)
 
 ## Run
+
+Native:
 
 ```sh
 cargo run --release
@@ -14,6 +17,19 @@ cargo run --release
 
 Requires `ffmpeg` on `PATH`. On first launch a small demo graph is created.
 Paste an absolute video path into the Input node, then use the timestamp slider.
+
+Browser:
+
+```sh
+rustup target add wasm32-unknown-unknown   # once
+cargo install trunk wasm-bindgen-cli       # once (versions must match)
+trunk build --release
+python3 web/serve.py                       # http://127.0.0.1:8080
+```
+
+The browser build loads FFmpeg from a CDN on first use and keeps picked files in
+in-memory MEMFS; exports download through the browser. See
+[Development](docs/development.md#webassembly).
 
 ## Documentation
 
@@ -25,7 +41,7 @@ Full documentation lives in the [`docs/`](docs/README.md) folder:
 | [**Nodes Reference**](docs/nodes.md) | Every node kind, ports, parameter ranges, exact FFmpeg filters |
 | [**Timeline**](docs/timeline.md) | Data model, trimming, snapping, transport, compilation to `trim`/`setpts` |
 | [**Compilation**](docs/compilation.md) | Graph validation, topological sort, fan-out split, argument assembly, escaping |
-| [**Architecture**](docs/architecture.md) | Module map, app state, Tokio preview engine, export thread, persistence |
+| [**Architecture**](docs/architecture.md) | Module map, app state, native/wasm preview engines, persistence |
 | [**Graph Format**](docs/graph-format.md) | `graph.json` schema, enum values, repair rules, safe hand-editing |
 | [**Development**](docs/development.md) | Build/test/lint commands, adding a new node, CI/release workflow |
 | [**Troubleshooting & FAQ**](docs/troubleshooting.md) | Solutions for common errors, LUT/font gotchas, performance, FAQ |
@@ -54,6 +70,9 @@ Full documentation lives in the [`docs/`](docs/README.md) folder:
 - **Color Balance**: separate Lift (shadows), Gamma (midtones), and Gain (highlights) RGB sliders mapped to `colorbalance`.
 - **Levels**: per-channel black point, white point, and gamma via `colorlevels` + `eq=gamma_r/g/b`; an approximate histogram placeholder is shown in the inspector.
 - **Invert / Solarize**: invert amounts map to `negate` (full) or a `lutrgb` blend (partial); solarisation inverts values above a threshold, also by amount.
+- **Matte Blur / Erode / Dilate**: mask cleanup with `boxblur` plus repeated `erosion`/`dilation` passes.
+- **Mask Combine**: multiply (AND), addition (OR), or difference (XOR) of two mask streams via `blend=all_mode=...`.
+- **Shape Mask**: procedural rectangle (`drawbox`) or feathered oval (`geq`) generated at canvas size, invertible.
 - **Output**: sets canvas dimensions, letterboxes the incoming stream, and drives export.
 
 ### Graph & Connection Lifecycle

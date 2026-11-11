@@ -1,22 +1,30 @@
 mod canvas;
+mod files;
+mod storage;
 mod timeline_view;
 mod viewer;
 
-use std::sync::mpsc::{channel, Receiver};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::time::Duration;
 
 use eframe::egui;
+use web_time::Instant;
 
 use crate::graph::compiler::{self, command_line, Compiled};
-use crate::graph::node::{demo_graph, hex_color, Graph, KeyMode, NodeId, NodeKind, TextPos};
-use crate::preview::engine::{self, Accel, PreviewEngine, PreviewMsg};
+use crate::graph::node::{
+    demo_graph, hex_color, Graph, KeyMode, MaskMode, MaskShape, NodeId, NodeKind, TextPos,
+};
+use crate::preview::{
+    self, Accel, ExportJob, ExportMsg, PreviewMsg, VideoEngineBackend, PREVIEW_H, PREVIEW_W,
+};
+use files::{PickKind, PickMsg, PickTarget};
 use timeline_view::TimelineDrag;
 
 const DEBOUNCE: Duration = Duration::from_millis(80);
 /// Scrubbing and clip drags should feel live; the extraction itself is the
 /// real frame budget.
 const SCRUB_DEBOUNCE: Duration = Duration::from_millis(33);
-const GRAPH_FILE: &str = "graph.json";
+pub(crate) const GRAPH_FILE: &str = "graph.json";
 const EXPORT_FILE: &str = "export.mp4";
 
 pub struct App {
@@ -24,7 +32,7 @@ pub struct App {
     accel: Accel,
     timestamp: f32,
 
-    engine: Option<PreviewEngine>,
+    engine: Option<Box<dyn VideoEngineBackend>>,
     texture: Option<egui::TextureHandle>,
     preview_error: Option<String>,
     preview_note: Option<String>,
@@ -55,7 +63,10 @@ pub struct App {
     status: Option<(String, bool)>,
     export_path: String,
     export_progress: f32,
-    export_rx: Option<Receiver<engine::ExportMsg>>,
+    export_rx: Option<Receiver<ExportMsg>>,
+    pick_tx: Sender<PickMsg>,
+    pick_rx: Receiver<PickMsg>,
+    picking: bool,
 
     /// Debounce length is switched by `seek`/`touch`: scrubs fire faster than
     /// graph edits.
@@ -70,16 +81,16 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
 
-        let mut graph = std::fs::read_to_string(GRAPH_FILE)
-            .ok()
+        let mut graph = storage::load()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_else(demo_graph);
         graph.timeline.repair(graph.nodes.len());
 
-        let (engine, status) = match PreviewEngine::new() {
+        let (engine, status) = match preview::create_engine() {
             Ok(engine) => (Some(engine), None),
             Err(error) => (None, Some((error, false))),
         };
+        let (pick_tx, pick_rx) = channel();
 
         Self {
             graph,
@@ -103,6 +114,9 @@ impl App {
             export_path: EXPORT_FILE.to_string(),
             export_progress: 0.0,
             export_rx: None,
+            pick_tx,
+            pick_rx,
+            picking: false,
             debounce: DEBOUNCE,
             timeline_drag: None,
             playback_anchor: None,
@@ -216,10 +230,7 @@ impl App {
                         continue; // result of a request we already replaced
                     }
                     let image = egui::ColorImage::from_rgba_unmultiplied(
-                        [
-                            crate::preview::engine::PREVIEW_W as usize,
-                            crate::preview::engine::PREVIEW_H as usize,
-                        ],
+                        [PREVIEW_W as usize, PREVIEW_H as usize],
                         &pixels,
                     );
                     self.texture = Some(ctx.load_texture(
@@ -244,6 +255,47 @@ impl App {
         }
     }
 
+    fn poll_files(&mut self, ctx: &egui::Context) {
+        while let Ok(message) = self.pick_rx.try_recv() {
+            self.picking = false;
+            match message {
+                PickMsg::Error(error) => self.notify(error, false),
+                PickMsg::Done(_, None) => {}
+                PickMsg::Done(target, Some(file)) => match target {
+                    PickTarget::Export => {
+                        if !file.path.trim().is_empty() {
+                            self.export_path = file.path;
+                        }
+                    }
+                    PickTarget::Node(id, kind) => {
+                        let Some(node) = self.graph.nodes.get_mut(id) else {
+                            continue;
+                        };
+                        let changed = match (&mut node.kind, kind) {
+                            (NodeKind::Input { path }, PickKind::Video)
+                            | (NodeKind::Image { path, .. }, PickKind::Image)
+                            | (NodeKind::Lut3d { path }, PickKind::Lut) => {
+                                *path = file.path;
+                                true
+                            }
+                            (NodeKind::Text { font_file, .. }, PickKind::Font) => {
+                                *font_file = file.path;
+                                true
+                            }
+                            _ => false,
+                        };
+                        if changed {
+                            self.touch();
+                        }
+                    }
+                },
+            }
+        }
+        if self.picking {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+
     fn add_node(&mut self, kind: NodeKind) {
         let index = self.graph.nodes.len();
         let pos = [
@@ -262,23 +314,24 @@ impl App {
                 ui.heading("FFNodeComp");
                 ui.separator();
 
-                egui::ComboBox::from_label("Acceleration")
-                    .selected_text(self.accel.label())
-                    .show_ui(ui, |ui| {
-                        for accel in Accel::ALL {
-                            if ui
-                                .selectable_value(&mut self.accel, accel, accel.label())
-                                .clicked()
-                            {
-                                if let Some(engine) = &mut self.engine {
-                                    engine.reset_fallback();
+                if !cfg!(target_arch = "wasm32") {
+                    egui::ComboBox::from_label("Acceleration")
+                        .selected_text(self.accel.label())
+                        .show_ui(ui, |ui| {
+                            for accel in Accel::ALL {
+                                if ui
+                                    .selectable_value(&mut self.accel, accel, accel.label())
+                                    .clicked()
+                                {
+                                    if let Some(engine) = &mut self.engine {
+                                        engine.reset_fallback();
+                                    }
+                                    self.touch();
                                 }
-                                self.touch();
                             }
-                        }
-                    });
-
-                ui.separator();
+                        });
+                    ui.separator();
+                }
                 if ui.button("Save graph").clicked() {
                     self.save_graph();
                 }
@@ -298,17 +351,13 @@ impl App {
                     .on_hover_text("Choose export destination")
                     .clicked()
                 {
-                    let mut dialog = rfd::FileDialog::new()
-                        .set_file_name(&self.export_path)
-                        .add_filter("MP4 Video", &["mp4"]);
-                    if let Some(parent) = std::path::Path::new(&self.export_path).parent() {
-                        if parent.exists() && parent != std::path::Path::new("") {
-                            dialog = dialog.set_directory(parent);
-                        }
-                    }
-                    if let Some(file) = dialog.save_file() {
-                        self.export_path = file.to_string_lossy().into_owned();
-                    }
+                    self.picking = true;
+                    files::pick(
+                        PickTarget::Export,
+                        PickKind::Video,
+                        &self.export_path,
+                        self.pick_tx.clone(),
+                    );
                 }
 
                 let can_export = self.compiled.is_some()
@@ -484,6 +533,31 @@ impl App {
                                 threshold: 0.5,
                             });
                         }
+                        if ui.button("Matte Blur").clicked() {
+                            self.add_node(NodeKind::MatteBlur {
+                                blur: 3.0,
+                                erode: 0,
+                                dilate: 0,
+                            });
+                        }
+                        ui.end_row();
+                        if ui.button("Mask Combine").clicked() {
+                            self.add_node(NodeKind::MaskCombine {
+                                mode: MaskMode::Multiply,
+                            });
+                        }
+                        if ui.button("Shape Mask").clicked() {
+                            self.add_node(NodeKind::ShapeMask {
+                                shape: MaskShape::Rectangle,
+                                width: 640,
+                                height: 360,
+                                x: 0,
+                                y: 0,
+                                feather: 20.0,
+                                invert: false,
+                                duration: 5.0,
+                            });
+                        }
                         ui.end_row();
                     });
 
@@ -518,6 +592,7 @@ impl App {
         ui.add_space(4.0);
 
         let mut changed = false;
+        let pick_tx = self.pick_tx.clone();
         {
             let kind = &mut self.graph.nodes[id].kind;
             match kind {
@@ -526,19 +601,13 @@ impl App {
                     ui.horizontal(|ui| {
                         changed |= ui.text_edit_singleline(path).changed();
                         if ui.button("Browse...").clicked() {
-                            let mut dialog = rfd::FileDialog::new().add_filter(
-                                "Video",
-                                &["mp4", "mkv", "mov", "avi", "webm", "flv", "m4v"],
+                            self.picking = true;
+                            files::pick(
+                                PickTarget::Node(id, PickKind::Video),
+                                PickKind::Video,
+                                path,
+                                pick_tx.clone(),
                             );
-                            if let Some(parent) = std::path::Path::new(path).parent() {
-                                if parent.exists() && parent != std::path::Path::new("") {
-                                    dialog = dialog.set_directory(parent);
-                                }
-                            }
-                            if let Some(file) = dialog.pick_file() {
-                                *path = file.to_string_lossy().into_owned();
-                                changed = true;
-                            }
                         }
                     });
                     ui.label(
@@ -734,17 +803,13 @@ impl App {
                     ui.horizontal(|ui| {
                         changed |= ui.text_edit_singleline(font_file).changed();
                         if ui.button("Browse...").clicked() {
-                            let mut dialog = rfd::FileDialog::new()
-                                .add_filter("Fonts", &["ttf", "otf", "woff", "woff2"]);
-                            if let Some(parent) = std::path::Path::new(font_file).parent() {
-                                if parent.exists() && parent != std::path::Path::new("") {
-                                    dialog = dialog.set_directory(parent);
-                                }
-                            }
-                            if let Some(file) = dialog.pick_file() {
-                                *font_file = file.to_string_lossy().into_owned();
-                                changed = true;
-                            }
+                            self.picking = true;
+                            files::pick(
+                                PickTarget::Node(id, PickKind::Font),
+                                PickKind::Font,
+                                font_file,
+                                pick_tx.clone(),
+                            );
                         }
                     });
                     ui.horizontal(|ui| {
@@ -775,19 +840,13 @@ impl App {
                     ui.horizontal(|ui| {
                         changed |= ui.text_edit_singleline(path).changed();
                         if ui.button("Browse...").clicked() {
-                            let mut dialog = rfd::FileDialog::new().add_filter(
-                                "Images",
-                                &["png", "jpg", "jpeg", "webp", "bmp", "gif"],
+                            self.picking = true;
+                            files::pick(
+                                PickTarget::Node(id, PickKind::Image),
+                                PickKind::Image,
+                                path,
+                                pick_tx.clone(),
                             );
-                            if let Some(parent) = std::path::Path::new(path).parent() {
-                                if parent.exists() && parent != std::path::Path::new("") {
-                                    dialog = dialog.set_directory(parent);
-                                }
-                            }
-                            if let Some(file) = dialog.pick_file() {
-                                *path = file.to_string_lossy().into_owned();
-                                changed = true;
-                            }
                         }
                     });
                     egui::Grid::new("image_grid").num_columns(2).show(ui, |ui| {
@@ -924,17 +983,13 @@ impl App {
                     ui.horizontal(|ui| {
                         changed |= ui.text_edit_singleline(path).changed();
                         if ui.button("Browse...").clicked() {
-                            let mut dialog =
-                                rfd::FileDialog::new().add_filter("3D LUT", &["cube", "3dl"]);
-                            if let Some(parent) = std::path::Path::new(path).parent() {
-                                if parent.exists() && parent != std::path::Path::new("") {
-                                    dialog = dialog.set_directory(parent);
-                                }
-                            }
-                            if let Some(file) = dialog.pick_file() {
-                                *path = file.to_string_lossy().into_owned();
-                                changed = true;
-                            }
+                            self.picking = true;
+                            files::pick(
+                                PickTarget::Node(id, PickKind::Lut),
+                                PickKind::Lut,
+                                path,
+                                pick_tx.clone(),
+                            );
                         }
                     });
                     ui.label(
@@ -1006,6 +1061,112 @@ impl App {
                         .weak(),
                     );
                 }
+                NodeKind::MatteBlur {
+                    blur,
+                    erode,
+                    dilate,
+                } => {
+                    changed |= ui
+                        .add(egui::Slider::new(blur, 0.0..=50.0).text("Blur radius"))
+                        .changed();
+                    changed |= ui
+                        .add(egui::Slider::new(erode, 0..=4).text("Erode passes"))
+                        .changed();
+                    changed |= ui
+                        .add(egui::Slider::new(dilate, 0..=4).text("Dilate passes"))
+                        .changed();
+                    ui.label(
+                        egui::RichText::new(
+                            "Mask-only: boxblur + repeated erosion/dilation, normalised to gray.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+                NodeKind::MaskCombine { mode } => {
+                    egui::ComboBox::from_label("Mode")
+                        .selected_text(mode.label())
+                        .show_ui(ui, |ui| {
+                            for option in MaskMode::ALL {
+                                if ui.selectable_value(mode, option, option.label()).clicked() {
+                                    changed = true;
+                                }
+                            }
+                        });
+                    ui.label(
+                        egui::RichText::new(
+                            "blend=all_mode=multiply/addition/difference on two mask ports.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+                NodeKind::ShapeMask {
+                    shape,
+                    width,
+                    height,
+                    x,
+                    y,
+                    feather,
+                    invert,
+                    duration,
+                } => {
+                    egui::ComboBox::from_label("Shape")
+                        .selected_text(shape.label())
+                        .show_ui(ui, |ui| {
+                            for option in MaskShape::ALL {
+                                if ui.selectable_value(shape, option, option.label()).clicked() {
+                                    changed = true;
+                                }
+                            }
+                        });
+                    egui::Grid::new("shape_mask_grid")
+                        .num_columns(2)
+                        .show(ui, |ui| {
+                            ui.label("Width");
+                            changed |= ui
+                                .add(egui::DragValue::new(width).range(2..=7680).speed(2))
+                                .changed();
+                            ui.end_row();
+                            ui.label("Height");
+                            changed |= ui
+                                .add(egui::DragValue::new(height).range(2..=7680).speed(2))
+                                .changed();
+                            ui.end_row();
+                            ui.label("X");
+                            changed |= ui
+                                .add(egui::DragValue::new(x).range(-7680..=7680))
+                                .changed();
+                            ui.end_row();
+                            ui.label("Y");
+                            changed |= ui
+                                .add(egui::DragValue::new(y).range(-7680..=7680))
+                                .changed();
+                            ui.end_row();
+                            ui.label("Feather");
+                            changed |= ui
+                                .add(egui::Slider::new(feather, 0.0..=200.0).text("px"))
+                                .changed();
+                            ui.end_row();
+                            ui.label("Duration");
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(duration)
+                                        .range(0.1..=600.0)
+                                        .suffix("s"),
+                                )
+                                .changed();
+                            ui.end_row();
+                        });
+                    changed |= ui.checkbox(invert, "Invert mask").changed();
+                    ui.label(
+                        egui::RichText::new(
+                            "Generated at Output canvas size with drawbox/geq and a feathered edge.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
                 NodeKind::Output { width, height } => {
                     egui::Grid::new("output_grid")
                         .num_columns(2)
@@ -1052,7 +1213,7 @@ impl App {
     fn save_graph(&mut self) {
         let result = serde_json::to_string_pretty(&self.graph)
             .map_err(|error| error.to_string())
-            .and_then(|json| std::fs::write(GRAPH_FILE, json).map_err(|error| error.to_string()));
+            .and_then(|json| storage::save(&json));
         match result {
             Ok(()) => self.notify(format!("Saved {GRAPH_FILE}"), true),
             Err(error) => self.notify(format!("Save failed: {error}"), false),
@@ -1060,8 +1221,8 @@ impl App {
     }
 
     fn load_graph(&mut self) {
-        let result = std::fs::read_to_string(GRAPH_FILE)
-            .map_err(|error| error.to_string())
+        let result = storage::load()
+            .ok_or_else(|| format!("no {GRAPH_FILE} found"))
             .and_then(|text| {
                 serde_json::from_str::<Graph>(&text).map_err(|error| error.to_string())
             });
@@ -1096,39 +1257,34 @@ impl App {
         };
 
         let out_path = self.export_path.clone();
-        let total_duration = engine::estimated_duration(&self.graph);
+        // ffmpeg.wasm writes into MEMFS, so the written path is fixed and only
+        // the browser download name comes from the picker.
+        let out = if cfg!(target_arch = "wasm32") {
+            EXPORT_FILE.to_string()
+        } else {
+            out_path.clone()
+        };
+        let total_duration = preview::estimated_duration(&self.graph);
         let accel = self.accel;
-        let gpu_args = compiled.export_args(&out_path, accel);
-        let cpu_args = compiled.export_args(&out_path, Accel::Cpu);
+        let gpu_args = compiled.export_args(&out, accel);
+        let cpu_args = compiled.export_args(&out, Accel::Cpu);
+        let download_name = std::path::Path::new(&out_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(EXPORT_FILE)
+            .to_string();
         let (tx, rx) = channel();
 
-        std::thread::spawn(move || {
-            let tx_prog = tx.clone();
-            let run_with_progress = |args: &[String]| {
-                let tx = tx_prog.clone();
-                engine::run_export(args, total_duration, move |frac| {
-                    let _ = tx.send(engine::ExportMsg::Progress(frac));
-                })
-            };
-
-            let res = if accel == Accel::Cpu {
-                match run_with_progress(&gpu_args) {
-                    Ok(()) => Ok(format!("Export finished: {out_path}")),
-                    Err(error) => Err(format!("Export failed: {error}")),
-                }
-            } else {
-                match run_with_progress(&gpu_args) {
-                    Ok(()) => Ok(format!("Export finished: {out_path}")),
-                    Err(gpu_error) => match run_with_progress(&cpu_args) {
-                        Ok(()) => Ok(format!("Export finished: {out_path} (CPU fallback)")),
-                        Err(cpu_error) => {
-                            Err(format!("Export failed: {cpu_error} (GPU: {gpu_error})"))
-                        }
-                    },
-                }
-            };
-            let _ = tx.send(engine::ExportMsg::Finished(res));
-        });
+        preview::spawn_export(
+            ExportJob {
+                args: gpu_args,
+                fallback: (accel != Accel::Cpu).then_some(cpu_args),
+                total: total_duration,
+                out,
+                download_name,
+            },
+            tx,
+        );
 
         self.export_progress = 0.0;
         self.export_rx = Some(rx);
@@ -1141,10 +1297,10 @@ impl App {
         };
         loop {
             match rx.try_recv() {
-                Ok(engine::ExportMsg::Progress(frac)) => {
+                Ok(ExportMsg::Progress(frac)) => {
                     self.export_progress = frac;
                 }
-                Ok(engine::ExportMsg::Finished(res)) => {
+                Ok(ExportMsg::Finished(res)) => {
                     match res {
                         Ok(msg) => {
                             self.export_progress = 1.0;
@@ -1206,6 +1362,7 @@ fn rgb_sliders(
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.poll_files(&ctx);
         self.poll_preview(&ctx);
         self.poll_export();
         self.handle_timeline_keys(&ctx);

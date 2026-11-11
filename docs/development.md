@@ -61,6 +61,58 @@ Recommended pre-commit gate:
 cargo fmt --check && cargo clippy --all-targets && cargo test
 ```
 
+## WebAssembly
+
+The browser build uses the same `ui::App` through `src/lib.rs`; `main.rs` is
+native-only. `Cargo.toml` splits dependencies by target: Tokio is native-only,
+while `wasm-bindgen`, `wasm-bindgen-futures`, `js-sys` and `web-sys` are
+wasm-only. `web-time` replaces `std::time::Instant` on wasm.
+
+Prerequisites:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install trunk wasm-bindgen-cli
+```
+
+`trunk` and `wasm-bindgen-cli` must be compatible with the `wasm-bindgen`
+crate version Cargo resolves. A version mismatch produces an error telling you
+which CLI version to install.
+
+Build and serve:
+
+```sh
+trunk build                 # debug; dist/ is ready for any static server
+trunk build --release
+python3 web/serve.py        # http://127.0.0.1:8080, with COOP/COEP headers
+```
+
+`index.html` selects the library target with
+`data-target-name="ffnodecomp_web"` because the crate also has a native binary.
+Trunk injects the `init()` call and exposes the exports as
+`window.wasmBindings`; the page then constructs `WebHandle` and starts it on
+`#the_canvas_id`.
+
+The FFmpeg runtime is not bundled. `web/ffmpeg_bridge.js` loads pinned
+`@ffmpeg/ffmpeg`, `@ffmpeg/util` and `@ffmpeg/core` builds from jsDelivr on
+first use, so the first preview or export needs network access. Browsers refuse
+cross-origin Worker URLs, so the matching `worker.js`, `const.js` and
+`errors.js` are vendored under `web/ffmpeg_worker/` (copied into `dist/` by
+Trunk) and passed via `classWorkerURL`. Keep that copy in sync when bumping
+`@ffmpeg/ffmpeg`. The core is single-threaded; `web/serve.py` still sends
+`Cross-Origin-Opener-Policy` and `Cross-Origin-Embedder-Policy` so a
+multi-threaded core can be swapped in later.
+
+Check the wasm target explicitly:
+
+```sh
+cargo check --target wasm32-unknown-unknown
+trunk build
+```
+
+There is no wasm test runner. Rust-side graph/compiler tests run natively;
+browser behaviour (dialogs, MEMFS, downloads) is manual.
+
 ## Test suite
 
 Tests are inline `#[cfg(test)]` modules next to the code they exercise. There is
@@ -99,7 +151,7 @@ Guides:
 - `run_export_reports_progress_and_completes` writes
   `/tmp/opencode/export_test.mp4`; create that directory first if it does not
   exist.
-- The suite contains 39 tests at the time of writing. New node work should add at
+- The suite contains 41 tests at the time of writing. New node work should add at
   least a filter-string test, plus a real render test when the FFmpeg mapping is
   non-trivial.
 
@@ -110,16 +162,19 @@ Run them locally before tagging.
 
 ```toml
 eframe = "0.37"                # egui + winit + glow; native app shell
-rfd = "0.17.2"                 # native open/save dialogs (XDG portal / Zenity)
+rfd = "0.17.2"                 # open/save dialogs (native + browser async)
 serde = { version="1", features=["derive"] }
 serde_json = "1"               # graph.json
-tokio = { version="1", features=["full"] }  # preview process + abortable tasks
+web-time = "1"                 # wasm-safe Instant
+tokio = { version="1", features=["full"] }  # native-only: preview process
+wasm-bindgen / js-sys / web-sys             # wasm-only bridge
 ```
 
 There is no `egui_node_graph2`: it is pinned to egui 0.29 while this app needs
 0.37, so `src/ui/canvas.rs` is a hand-rolled canvas (~650 lines). There are no
-FFmpeg bindings; the CLI is the API. No image, audio, or logging crates. Avoid
-adding a dependency unless the task genuinely needs it.
+FFmpeg bindings; the CLI is the API natively and `@ffmpeg/ffmpeg` is the API in
+the browser. No image, audio, or logging crates. Avoid adding a dependency
+unless the task genuinely needs it.
 
 ## Project conventions
 

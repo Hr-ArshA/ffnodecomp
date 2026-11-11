@@ -1,8 +1,7 @@
-mod graph;
-mod preview;
-mod timeline;
-mod ui;
+#[cfg(not(target_arch = "wasm32"))]
+use ffnodecomp_web::ui;
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -17,3 +16,8 @@ fn main() -> eframe::Result<()> {
         Box::new(|cc| Ok(Box::new(ui::App::new(cc)))),
     )
 }
+
+/// The browser entry point is `WebHandle` in the library; this binary target
+/// only exists so Cargo has a `main` on every platform.
+#[cfg(target_arch = "wasm32")]
+fn main() {}

@@ -258,6 +258,35 @@ types are exact (see [Graph format](graph-format.md)).
 - **Wrong file is hidden by the filter.** Use the dialog's “All files” option
   where available, or type the path.
 
+## Browser / WebAssembly
+
+- **Blank page after `trunk build`.** Serve `dist/` over HTTP; opening
+  `index.html` from `file://` blocks ES modules and wasm fetches. Use
+  `python3 web/serve.py` or any static server.
+- **`Failed to fetch dynamically imported module` / CDN errors.** The FFmpeg
+  core is loaded from jsDelivr at first preview/export. Check network access,
+  proxy rules, and ad-blockers. Versions are pinned in `web/ffmpeg_bridge.js`.
+- **`SharedArrayBuffer` / cross-origin isolation warnings.** The bundled core is
+  single-threaded and does not need them. If you swap in a multi-threaded core,
+  serve with COOP `same-origin` and COEP `require-corp` (`web/serve.py` does).
+- **First preview is slow.** The browser downloads and instantiates ~30 MB of
+  FFmpeg core once per page load. Later frames reuse it.
+- **Browse does nothing.** Browser file pickers must be opened from a user
+  gesture. The app calls the async dialog directly from the button click; a
+  programmatic call outside a click will be ignored.
+- **`graph.json` is not on disk.** The web build stores it in `localStorage`
+  under the same key. Clearing site data deletes it. Export/import across
+  machines is not implemented.
+- **Export path looks ignored.** The browser cannot write arbitrary paths. The
+  render always goes to MEMFS `export.mp4`; the chosen name is the download
+  filename.
+- **Large media exhausts memory.** Picked files and render output all live in
+  RAM (MEMFS). Prefer short clips and 720p proxies in the browser.
+- **Acceleration is missing.** ffmpeg.wasm has no CUDA/VideoToolbox/VAAPI path;
+  the controls are hidden and everything is decoded/encoded on the CPU.
+- **`wasm-bindgen` version mismatch during trunk build.** Install the CLI version
+  Cargo resolved: `cargo install wasm-bindgen-cli --version <x.y.z>`.
+
 ## Performance
 
 - Preview renders one frame per debounce window. Every slider release spawns an

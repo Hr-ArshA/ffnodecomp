@@ -111,6 +111,10 @@ Each node contributes exactly one filter string. The full mappings live in
 - `Alpha Key` with a mask first emits a separate `scale2ref` statement, then the
   `alphamerge` statement. The `scale2ref` input order is `mask, video`; the
   `alphamerge` order is `video, mask`.
+- `Mask Combine` emits a `scale2ref` that scales mask B to mask A, then a
+  `blend` statement. This is required because `blend` rejects mismatched sizes.
+- Mask producers (`Matte Blur`, `Mask Combine`, `Shape Mask`) finish with
+  `format=gray`. `Shape Mask` is a source and emits no incoming label.
 - `Output` emits its letterbox filter and `[vout]` and stops.
 - Everything else consumes one video label and produces one.
 
@@ -217,6 +221,15 @@ pipe:1
   reports an error including the byte count and hints at the timestamp being
   past the clip end.
 - Preview never writes a file and never carries audio.
+
+In the wasm build the last two lines become:
+
+```text
+-y preview.rgba
+```
+
+`preview.rgba` is the MEMFS file; Rust reads it back as `Uint8Array` after the
+exec resolves. Native uses `pipe:1` and reads the child's stdout.
 
 ### Export
 

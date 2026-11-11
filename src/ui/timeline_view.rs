@@ -3,11 +3,10 @@
 //! egui has no multi-track widget, so everything is painted by hand (the same
 //! approach as the node canvas) and hit-tested with per-clip interact rects.
 
-use std::time::Instant;
-
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Rect, Sense, Stroke, StrokeKind, Vec2,
 };
+use web_time::Instant;
 
 use super::App;
 use crate::timeline::{ClipDragMode, FrameIndex, PlaybackState, Timecode, TrackId, TrackKind};

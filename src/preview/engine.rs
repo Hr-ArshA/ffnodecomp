@@ -10,59 +10,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
-/// Preview output is fixed-size so the UI knows the raw buffer layout without
-/// probing the source. Aspect ratio is preserved and letterboxed.
-pub const PREVIEW_W: u32 = 640;
-pub const PREVIEW_H: u32 = 360;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Accel {
-    Cpu,
-    Cuda,
-    VideoToolbox,
-    Vaapi,
-}
-
-impl Accel {
-    pub const ALL: [Accel; 4] = [Accel::Cpu, Accel::Cuda, Accel::VideoToolbox, Accel::Vaapi];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Accel::Cpu => "CPU / software",
-            Accel::Cuda => "NVIDIA (CUDA / NVENC)",
-            Accel::VideoToolbox => "Apple (VideoToolbox)",
-            Accel::Vaapi => "Linux (VAAPI)",
-        }
-    }
-
-    /// Decode-side flags. `-hwaccel_output_format` is deliberately omitted:
-    /// the filter graph runs on the CPU and FFmpeg downloads frames for us.
-    pub fn decode_flags(self) -> &'static [&'static str] {
-        match self {
-            Accel::Cpu => &[],
-            Accel::Cuda => &["-hwaccel", "cuda"],
-            Accel::VideoToolbox => &["-hwaccel", "videotoolbox"],
-            Accel::Vaapi => &["-hwaccel", "vaapi"],
-        }
-    }
-}
-
-pub enum PreviewMsg {
-    Frame {
-        generation: u64,
-        pixels: Vec<u8>,
-        note: Option<String>,
-    },
-    Error {
-        generation: u64,
-        message: String,
-    },
-}
-
-pub enum ExportMsg {
-    Progress(f32),
-    Finished(Result<String, String>),
-}
+use super::{ExportJob, ExportMsg, PreviewMsg, VideoEngineBackend, PREVIEW_H, PREVIEW_W};
 
 pub struct PreviewEngine {
     rt: Runtime,
@@ -175,6 +123,54 @@ impl PreviewEngine {
             }
         }));
     }
+}
+
+impl VideoEngineBackend for PreviewEngine {
+    fn poll(&mut self) -> Option<PreviewMsg> {
+        PreviewEngine::poll(self)
+    }
+
+    fn request(&mut self, generation: u64, gpu: Option<Vec<String>>, cpu: Vec<String>) {
+        PreviewEngine::request(self, generation, gpu, cpu);
+    }
+
+    fn cancel(&mut self) {
+        PreviewEngine::cancel(self);
+    }
+
+    fn reset_fallback(&mut self) {
+        PreviewEngine::reset_fallback(self);
+    }
+}
+
+/// Spawn the native export thread. The UI polls the receiver.
+pub fn spawn_export(job: ExportJob, tx: std::sync::mpsc::Sender<ExportMsg>) {
+    let ExportJob {
+        args,
+        fallback,
+        total,
+        out,
+        ..
+    } = job;
+    std::thread::spawn(move || {
+        let run = |args: &[String]| {
+            let progress = tx.clone();
+            run_export(args, total, move |frac| {
+                let _ = progress.send(ExportMsg::Progress(frac));
+            })
+        };
+        let res = match run(&args) {
+            Ok(()) => Ok(format!("Export finished: {out}")),
+            Err(primary) => match fallback {
+                Some(cpu_args) => match run(&cpu_args) {
+                    Ok(()) => Ok(format!("Export finished: {out} (CPU fallback)")),
+                    Err(cpu) => Err(format!("Export failed: {cpu} (GPU: {primary})")),
+                },
+                None => Err(format!("Export failed: {primary}")),
+            },
+        };
+        let _ = tx.send(ExportMsg::Finished(res));
+    });
 }
 
 async fn run_frame(args: &[String]) -> Result<Vec<u8>, String> {
@@ -336,31 +332,6 @@ pub fn probe_duration(path: &str) -> Option<f32> {
     }
 
     None
-}
-
-pub fn estimated_duration(graph: &crate::graph::node::Graph) -> f32 {
-    use crate::graph::node::NodeKind;
-    let mut max_dur: f32 = 0.0;
-    for node in &graph.nodes {
-        match &node.kind {
-            NodeKind::SolidColor { duration, .. }
-            | NodeKind::Image { duration, .. }
-            | NodeKind::Text { duration, .. } => {
-                max_dur = max_dur.max(*duration);
-            }
-            NodeKind::Input { path } => {
-                if let Some(dur) = probe_duration(path) {
-                    max_dur = max_dur.max(dur);
-                }
-            }
-            _ => {}
-        }
-    }
-    if max_dur > 0.0 {
-        max_dur
-    } else {
-        5.0
-    }
 }
 
 fn error_tail(stderr: &[u8]) -> String {

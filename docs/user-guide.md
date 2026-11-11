@@ -64,7 +64,8 @@ Text           Image
 Solid Color    Blur
 Sharpen        3D LUT
 Color Balance  Levels
-Invert / Solarize
+Invert / Solarize  Matte Blur
+Mask Combine   Shape Mask
 ```
 
 New nodes get sensible defaults; see the "Palette defaults" table in
@@ -209,6 +210,10 @@ completion the status line reports the file path. If a GPU encoder was selected
 but failed, export automatically retries once with the CPU path and reports
 `(CPU fallback)`.
 
+In the browser build the render happens in ffmpeg.wasm and the destination picker
+only chooses a **download filename**; the file arrives through the browser's
+download flow. The acceleration selector is hidden and the CPU row below applies.
+
 Output is always H.264:
 
 | Acceleration | Encoder | Extra |
@@ -239,6 +244,9 @@ Not persisted:
 
 The graph is loaded on startup if the file parses; otherwise the built-in demo
 graph is used. There is no automatic save.
+
+In the browser, **Save graph** writes the same JSON to `localStorage`; there is
+no file on disk and clearing site data removes it.
 
 ## Current limitations (short)
 

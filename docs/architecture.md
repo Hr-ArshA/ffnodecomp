@@ -3,15 +3,18 @@
 This page describes how the code is organised, what owns what, and how a frame
 travels from a widget edit to an FFmpeg process and back.
 
-The project is deliberately small (~6.2k lines of Rust) and dependency-lean:
-eframe/egui for the UI, `rfd` for native file dialogs, serde for persistence,
-Tokio for cancellable preview work. FFmpeg is invoked as an external process.
+The project is deliberately small (~7k lines of Rust) and dependency-lean:
+eframe/egui for the UI, `rfd` for file dialogs, serde for persistence, Tokio for
+cancellable native preview work, and `ffmpeg.wasm` in the browser. Native builds
+invoke FFmpeg as an external process; the wasm build runs it inside a worker.
 
 ## Module map
 
 ```text
 src/
-├── main.rs                 eframe entry point, window options, module declarations
+├── lib.rs                  shared modules + wasm `WebHandle` entry point
+├── main.rs                 native eframe entry point
+├── assets.rs               wasm in-memory asset pool (picked files → MEMFS)
 ├── graph/
 │   ├── mod.rs              compiler, mutations, node, nodes
 │   ├── node.rs             NodeKind, Node, Link, Graph, ports, defaults, demo graph
@@ -23,16 +26,23 @@ src/
 │       ├── solid_color.rs  lavfi `color` source
 │       └── text.rs         drawtext source/filter, position sanitising, text escaping
 ├── preview/
-│   ├── mod.rs
-│   └── engine.rs           Accel, Tokio preview worker, run_export, probe_duration
+│   ├── mod.rs              shared messages, ExportJob, VideoEngineBackend, cfg dispatch
+│   ├── engine.rs           native Accel, Tokio worker, run_export, probe_duration
+│   └── web_engine.rs       wasm backend: ffmpeg.wasm bridge, MEMFS, downloads
 ├── timeline/
 │   └── mod.rs              FrameIndex, Timecode, Clip, Track, TimelineState, drag/snap/loop
 └── ui/
     ├── mod.rs              App state, panels, inspector, save/load, export, debounce
+    ├── files.rs            native blocking dialogs vs wasm async dialogs/virtual names
+    ├── storage.rs          graph.json on disk vs localStorage
     ├── canvas.rs           hand-rolled node canvas, ports, wires, inline controls
     ├── timeline_view.rs    docked timeline painting, clip/ruler interaction, transport
     └── viewer.rs           preview image, timestamp slider, command inspector
 ```
+
+Platform assets live outside `src/`: `index.html`, `Trunk.toml`,
+`web/ffmpeg_bridge.js` (the JS side of the wasm engine) and `web/serve.py`
+(COOP/COEP dev server).
 
 Rules of thumb visible in the code:
 
@@ -45,10 +55,11 @@ Rules of thumb visible in the code:
   `compiler.rs` because that is where their ordering relative to `format=rgba`
   matters.
 - `ui` is the only place that knows about `egui`, `eframe`, `rfd` and panel
-  layout. It calls `compiler::compile` and `PreviewEngine`, never FFmpeg
-  directly (except through `preview::engine` functions).
-- `preview` owns every process concern: spawn, pipes, cancellation, encoders,
-  progress parsing, duration probing.
+  layout. It calls `compiler::compile` and `VideoEngineBackend`, never FFmpeg
+  directly.
+- `preview` owns every process/engine concern: spawn, pipes, cancellation,
+  encoders, progress parsing, duration probing. `preview::create_engine` and
+  `preview::spawn_export` hide which backend was compiled in.
 
 ## Core data
 
@@ -243,19 +254,47 @@ Reading stdout/stderr uses `wait_with_output`, which drains both concurrently.
 That prevents the classic deadlock where FFmpeg fills a pipe while the UI waits
 for the child.
 
+## WebAssembly backend
+
+The wasm build shares the whole graph/compiler/UI with native. Only the engine
+and the surrounding I/O differ:
+
+- `eframe::WebRunner` starts `ui::App` on `#the_canvas_id`; `WebHandle` in
+  `src/lib.rs` is the wasm-bindgen export used by `index.html`.
+- There is no process and no stdout. Preview writes one raw RGBA frame to the
+  MEMFS file `preview.rgba` and Rust reads it back as a `Uint8Array`.
+- Picked files are read with `rfd::AsyncFileDialog`, stored in
+  `assets.rs` (`thread_local` map + version counter) under virtual names such as
+  `input_3.mp4`, and that name is written into the node's `path`. Before an exec
+  the engine copies changed assets into MEMFS.
+- `web/ffmpeg_bridge.js` owns the singleton `FFmpeg` instance. All write/read/
+  exec calls go through one promise queue because MEMFS is shared. The bridge
+  loads `@ffmpeg/ffmpeg`, `@ffmpeg/util` and `@ffmpeg/core` from jsDelivr on
+  first use.
+- `ffmpeg.exec` has no cancellation. Rust keeps a generation token in the engine
+  and drops results whose token is no longer current; the JS queue still runs
+  the abandoned command to completion before the next one starts.
+- Export renders to the MEMFS file `export.mp4`, then the bridge creates a Blob
+  URL and clicks a download anchor. The UI's export name is only the download
+  filename.
+- `graph.json` persistence uses `localStorage` instead of the filesystem, and
+  duration probing is unavailable (progress falls back to configured durations).
+- Acceleration controls are hidden: ffmpeg.wasm always uses CPU args.
+- `std::time::Instant` is aliased to `web_time::Instant`; the std one panics on
+  `wasm32-unknown-unknown`.
+
 ## Export pipeline
 
 ```text
 start_export()
   ├── requires self.compiled (otherwise status error)
-  ├── total = preview::engine::estimated_duration(&graph)
+  ├── total = preview::estimated_duration(&graph)
   ├── gpu_args = compiled.export_args(path, accel)
   ├── cpu_args = compiled.export_args(path, Cpu)
-  ├── channel::<ExportMsg>()
-  └── std::thread::spawn:
-        if accel == Cpu: run cpu
-        else: run gpu; on Err run cpu
-        send Finished(Result<message, message>)
+  ├── ExportJob { args, fallback, total, out, download_name }
+  └── preview::spawn_export(job, tx)
+        native: std::thread runs gpu then cpu on failure
+        wasm:   spawn_local runs ffmpeg.wasm then Blob download
 
 run_export(args, total, on_progress):
   ├── inject -progress pipe:1 before -y (or append)
@@ -308,10 +347,13 @@ clamping live in `timeline/mod.rs` so they are unit-testable without egui.
 
 ## Persistence and compatibility
 
-- `GRAPH_FILE = "graph.json"`, `EXPORT_FILE = "export.mp4"`, both relative to the
-  process working directory.
-- Startup: `read_to_string(graph.json)` → `serde_json::from_str::<Graph>` →
-  fallback `demo_graph()`. A corrupt file silently starts the demo.
+- `GRAPH_FILE = "graph.json"`, `EXPORT_FILE = "export.mp4"`. Native resolves the
+  graph file against the process working directory; wasm stores it in
+  `localStorage` under the same key. In wasm, `EXPORT_FILE` is a MEMFS path and
+  the user-chosen name is only the browser download name.
+- Startup: `read_to_string(graph.json)` (or `localStorage`) →
+  `serde_json::from_str::<Graph>` → fallback `demo_graph()`. A corrupt file
+  silently starts the demo.
 - Load: renumber `node.id` to vector index, drop out-of-range links, `repair` the
   timeline, reset transient UI state, `touch`.
 - Save: `serde_json::to_string_pretty` then write; errors become red status
@@ -327,13 +369,13 @@ clamping live in `timeline/mod.rs` so they are unit-testable without egui.
 
 ## Threading summary
 
-| Work | Thread | Cancellation |
-| --- | --- | --- |
-| egui paint, graph edits, compile, save/load | UI (main) | n/a |
-| Preview FFmpeg spawn/wait/read | Tokio worker (2-thread runtime) | task abort + `kill_on_drop` |
-| Export FFmpeg | dedicated `std::thread` | none from UI; runs to completion |
-| Export stderr drain | another `std::thread` | joined after child exits |
-| Duration probing | UI thread, synchronous | short external process |
+| Work | Native | Wasm | Cancellation |
+| --- | --- | --- | --- |
+| egui paint, graph edits, compile, save/load | UI (main) | UI (main) | n/a |
+| Preview FFmpeg spawn/wait/read | Tokio worker (2-thread runtime) | JS promise queue (`spawn_local`) | task abort + `kill_on_drop` / generation token |
+| Export FFmpeg | dedicated `std::thread` | JS promise queue | none from UI; runs to completion |
+| Export stderr drain | another `std::thread` | n/a | joined after child exits |
+| Duration probing | UI thread, synchronous | unavailable | short external process |
 
 Duration probing during export start can block the UI briefly if `ffprobe` is
 slow. Preview and export never do.
@@ -345,10 +387,11 @@ therefore does not change the running export.
 
 ## Testing and design constraints
 
-- Unit tests live next to the modules. There are 39 at the time of writing,
+- Unit tests live next to the modules. There are 41 at the time of writing,
   covering cycle/port validation, `odd_matrix`, image/solid/text mappings, text
-  position sanitising, compiler filters, fan-out, timeline drag/loop/timecode,
-  `probe_duration` for a missing file, export progress, and shell quoting.
+  position sanitising, compiler filters, fan-out, mask filter chains, timeline
+  drag/loop/timecode, `probe_duration` for a missing file, export progress, and
+  shell quoting.
 - Real-FFmpeg tests are guarded: if `ffmpeg` cannot be spawned they return early,
   so the suite still passes on a machine without FFmpeg.
 - The `full_layer_stack_compiles_and_renders_with_real_ffmpeg` and

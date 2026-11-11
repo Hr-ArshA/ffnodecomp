@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FFNodeComp</title>
+    <link data-trunk rel="copy-dir" href="web/ffmpeg_worker" />
+    <link data-trunk rel="rust" data-target-name="ffnodecomp_web" data-wasm-opt="z" />
+    <style>
+      html,
+      body,
+      #the_canvas_id {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #15171c;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="the_canvas_id"></canvas>
+    <script type="module">
+      // Trunk's module uses top-level await, so this script may run before
+      // init() finishes. Wait for the event instead of racing it.
+      const start = async () => {
+        const handle = new window.wasmBindings.WebHandle();
+        await handle.start(document.getElementById("the_canvas_id"));
+        window.ffnodecomp = handle;
+      };
+      if (window.wasmBindings) start();
+      else addEventListener("TrunkApplicationStarted", start, { once: true });
+    </script>
+  </body>
+</html>

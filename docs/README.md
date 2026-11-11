@@ -5,10 +5,10 @@ filters together on a canvas, the graph is compiled into a single FFmpeg
 `-filter_complex` filtergraph, a still frame is rendered asynchronously for
 preview, and the result can be exported to an H.264 MP4.
 
-- **UI:** Rust + [egui/eframe](https://github.com/emilk/egui) 0.37, custom-drawn node canvas and timeline.
-- **Engine:** the system `ffmpeg` / `ffprobe` binaries, driven through `std::process` and Tokio.
+- **UI:** Rust + [egui/eframe](https://github.com/emilk/egui) 0.37, custom-drawn node canvas and timeline. Native desktop or WebAssembly in the browser.
+- **Engine:** the system `ffmpeg` / `ffprobe` binaries natively (Tokio), or `@ffmpeg/ffmpeg` (ffmpeg.wasm) in the browser.
 - **Dependency-lean:** no FFmpeg bindings, no graph-widget crate, no database.
-- **Storage:** plain JSON (`graph.json`) in the current working directory.
+- **Storage:** plain JSON (`graph.json`) on disk, or `localStorage` in the browser.
 - **License:** MIT.
 
 ## Contents
@@ -32,6 +32,8 @@ preview, and the result can be exported to an H.264 MP4.
 - Filters: brightness/contrast/saturation, Gaussian blur, unsharp sharpening,
   cinematic 3D LUT, lift/gamma/gain colour balance, levels + per-channel gamma,
   invert and solarize.
+- Masks: matte blur/erode/dilate, boolean mask combine, and procedural
+  rectangle/oval shape masks with feathering.
 - Single-frame, debounced preview at a fixed 640×360 RGBA, with automatic CPU
   fallback when a GPU path fails.
 - H.264 MP4 export with a live progress bar.
@@ -54,6 +56,17 @@ preview, and the result can be exported to an H.264 MP4.
 cargo run --release
 ```
 
+Browser build:
+
+```sh
+trunk build
+python3 web/serve.py     # http://127.0.0.1:8080
+```
+
+The browser fetches the FFmpeg core from a CDN on first use; picked media stays
+in memory and exports download as a file. See
+[Development § WebAssembly](development.md#webassembly).
+
 On first launch the app loads `graph.json` from the current working directory if
 it exists, otherwise it creates a small demo graph: `Input → Transform → Color →
 Output`.
@@ -73,8 +86,10 @@ type compatibility and cycles when made. Only nodes that can reach the first
 `Output` node are compiled. The compiler emits one filter statement per node in
 a deterministic topological order, normalises every intermediate stream to
 RGBA, inserts `split` where an output fans out, and produces two argument
-vectors: one for a single-frame preview and one for a full export. A Tokio worker
-runs FFmpeg for previews, tagged with a monotonically increasing graph generation
-so stale frames are discarded; export runs on a plain thread and reports
-progress through `-progress pipe:1`. The timeline is part of the graph data and
-turns clip windows into `trim` + `setpts` suffixes on source nodes.
+vectors: one for a single-frame preview and one for a full export. A
+`VideoEngineBackend` hides whether those arguments go to a Tokio-managed child
+process or to ffmpeg.wasm; the preview worker tags results with a monotonically
+increasing graph generation so stale frames are discarded. Export reports
+progress through `-progress pipe:1` natively and through the ffmpeg.wasm progress
+event in the browser. The timeline is part of the graph data and turns clip
+windows into `trim` + `setpts` suffixes on source nodes.

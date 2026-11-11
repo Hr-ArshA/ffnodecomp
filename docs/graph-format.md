@@ -78,6 +78,11 @@ variant that uses them.
                       "white": [1.0, 1.0, 1.0],
                       "gamma": [1.0, 1.0, 1.0] } }
 { "InvertSolarize": { "invert": 0.0, "solarize": 0.0, "threshold": 0.5 } }
+{ "MatteBlur":      { "blur": 3.0, "erode": 0, "dilate": 0 } }
+{ "MaskCombine":    { "mode": "Multiply" } }
+{ "ShapeMask":      { "shape": "Rectangle", "width": 640, "height": 360,
+                      "x": 0, "y": 0, "feather": 20.0, "invert": false,
+                      "duration": 5.0 } }
 { "Output":         { "width": 1280, "height": 720 } }
 ```
 
@@ -85,6 +90,8 @@ Enum values (always exact strings):
 
 - `AlphaKey.mode`: `"LumaKey"` | `"ExtractAlpha"` | `"InvertAlpha"`
 - `Text.position`: `"Center"` | `"TopCenter"` | `"BottomCenter"` | `"CustomXY"`
+- `MaskCombine.mode`: `"Multiply"` | `"Addition"` | `"Difference"`
+- `ShapeMask.shape`: `"Rectangle"` | `"Oval"`
 
 Numeric types are enforced: `u32` fields (dimensions, framerate, matrix sizes,
 `steps`) reject negative or fractional JSON numbers; `f32` fields accept

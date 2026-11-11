@@ -2,11 +2,13 @@
 //! to egui 0.29 while this app runs on eframe 0.37.
 
 use std::collections::HashMap;
+use std::sync::mpsc::Sender;
 
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
 };
 
+use super::files::{self, PickKind, PickMsg, PickTarget};
 use super::App;
 use crate::graph::node::{compatible, Node, NodeId, NodeKind, PortKind};
 
@@ -195,6 +197,9 @@ impl App {
                 NodeKind::ColorBalance { .. } => Color32::from_rgb(200, 150, 90),
                 NodeKind::Levels { .. } => Color32::from_rgb(120, 175, 200),
                 NodeKind::InvertSolarize { .. } => Color32::from_rgb(200, 100, 130),
+                NodeKind::MatteBlur { .. } => Color32::from_rgb(120, 120, 180),
+                NodeKind::MaskCombine { .. } => Color32::from_rgb(150, 110, 190),
+                NodeKind::ShapeMask { .. } => Color32::from_rgb(90, 150, 190),
                 NodeKind::Output { .. } => Color32::from_rgb(90, 170, 110),
             };
 
@@ -357,7 +362,13 @@ impl App {
                         |ui| {
                             ui.spacing_mut().slider_width = 70.0;
                             ui.spacing_mut().item_spacing.y = 2.0;
-                            changed |= inline_controls(ui, id, &mut self.graph.nodes[id].kind);
+                            changed |= inline_controls(
+                                ui,
+                                id,
+                                &mut self.graph.nodes[id].kind,
+                                &self.pick_tx,
+                                &mut self.picking,
+                            );
                         },
                     );
                 });
@@ -466,7 +477,13 @@ fn inline_height(kind: &NodeKind) -> f32 {
     }
 }
 
-fn inline_controls(ui: &mut egui::Ui, id: NodeId, kind: &mut NodeKind) -> bool {
+fn inline_controls(
+    ui: &mut egui::Ui,
+    id: NodeId,
+    kind: &mut NodeKind,
+    pick_tx: &Sender<PickMsg>,
+    picking: &mut bool,
+) -> bool {
     use crate::graph::node::{hex_color, KeyMode};
     let mut changed = false;
 
@@ -478,17 +495,13 @@ fn inline_controls(ui: &mut egui::Ui, id: NodeId, kind: &mut NodeKind) -> bool {
                 "Change video..."
             };
             if ui.button(egui::RichText::new(label).size(10.0)).clicked() {
-                let mut dialog = rfd::FileDialog::new()
-                    .add_filter("Video", &["mp4", "mkv", "mov", "avi", "webm", "flv", "m4v"]);
-                if let Some(parent) = std::path::Path::new(path).parent() {
-                    if parent.exists() && parent != std::path::Path::new("") {
-                        dialog = dialog.set_directory(parent);
-                    }
-                }
-                if let Some(file) = dialog.pick_file() {
-                    *path = file.to_string_lossy().into_owned();
-                    changed = true;
-                }
+                *picking = true;
+                files::pick(
+                    PickTarget::Node(id, PickKind::Video),
+                    PickKind::Video,
+                    path,
+                    pick_tx.clone(),
+                );
             }
         }
         NodeKind::Image { path, .. } => {
@@ -498,17 +511,13 @@ fn inline_controls(ui: &mut egui::Ui, id: NodeId, kind: &mut NodeKind) -> bool {
                 "Change image..."
             };
             if ui.button(egui::RichText::new(label).size(10.0)).clicked() {
-                let mut dialog = rfd::FileDialog::new()
-                    .add_filter("Images", &["png", "jpg", "jpeg", "webp", "bmp", "gif"]);
-                if let Some(parent) = std::path::Path::new(path).parent() {
-                    if parent.exists() && parent != std::path::Path::new("") {
-                        dialog = dialog.set_directory(parent);
-                    }
-                }
-                if let Some(file) = dialog.pick_file() {
-                    *path = file.to_string_lossy().into_owned();
-                    changed = true;
-                }
+                *picking = true;
+                files::pick(
+                    PickTarget::Node(id, PickKind::Image),
+                    PickKind::Image,
+                    path,
+                    pick_tx.clone(),
+                );
             }
         }
         NodeKind::ColorKey {

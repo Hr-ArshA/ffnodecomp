@@ -7,9 +7,11 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use super::node::{compatible, Graph, KeyMode, NodeId, NodeKind};
+use super::node::{compatible, Graph, KeyMode, MaskShape, NodeId, NodeKind};
 use super::nodes::{image, solid_color, text};
-use crate::preview::engine::{Accel, PREVIEW_H, PREVIEW_W};
+#[cfg(target_arch = "wasm32")]
+use crate::preview::PREVIEW_FILE;
+use crate::preview::{Accel, PREVIEW_H, PREVIEW_W};
 
 /// One FFmpeg input. Image sources need demuxer options and must not receive
 /// hardware decode flags.
@@ -74,6 +76,7 @@ impl Compiled {
             args.push("-ss".into());
             args.push(format!("{t:.3}"));
         }
+        #[cfg(not(target_arch = "wasm32"))]
         args.extend(
             [
                 "-frames:v",
@@ -83,6 +86,20 @@ impl Compiled {
                 "-pix_fmt",
                 "rgba",
                 "pipe:1",
+            ]
+            .map(String::from),
+        );
+        #[cfg(target_arch = "wasm32")]
+        args.extend(
+            [
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba",
+                "-y",
+                PREVIEW_FILE,
             ]
             .map(String::from),
         );
@@ -612,6 +629,95 @@ pub fn compile(graph: &Graph) -> Result<Compiled, String> {
                 }
                 filters.push_str(",format=rgba");
                 filters
+            }
+            NodeKind::MatteBlur {
+                blur,
+                erode,
+                dilate,
+            } => {
+                let blur = blur.clamp(0.0, 100.0);
+                let mut filter = String::from("format=gray");
+                if blur > 0.05 {
+                    filter.push_str(&format!(",boxblur=luma_radius={blur:.2}:luma_power=2"));
+                }
+                for _ in 0..(*erode).clamp(0, 4) {
+                    filter.push_str(",erosion");
+                }
+                for _ in 0..(*dilate).clamp(0, 4) {
+                    filter.push_str(",dilation");
+                }
+                filter.push_str(",format=gray");
+                filter
+            }
+            NodeKind::MaskCombine { mode } => {
+                // blend requires identical dimensions; scale mask B to mask A.
+                let s_a = format!("[n{id}ma]");
+                let s_b = format!("[n{id}mb]");
+                emit(
+                    &mut filter_complex,
+                    &[labels_in[1].clone(), labels_in[0].clone()],
+                    "scale2ref",
+                    &[s_b.clone(), s_a.clone()],
+                );
+                labels_in = vec![s_a, s_b];
+                format!(
+                    "format=gray,blend=all_mode={}:all_opacity=1,format=gray",
+                    mode.ffmpeg()
+                )
+            }
+            NodeKind::ShapeMask {
+                shape,
+                width,
+                height,
+                x,
+                y,
+                feather,
+                invert,
+                duration,
+            } => {
+                let cw = even(canvas_w);
+                let ch = even(canvas_h);
+                let bw = even(*width).max(2);
+                let bh = even(*height).max(2);
+                let feather = feather.clamp(0.0, 200.0);
+                let duration = duration.clamp(0.1, 600.0);
+                let d = format!("{duration:.3}");
+                let mut filter =
+                    format!("color=c=black:s={cw}x{ch}:d={d}:r=30,format=gray");
+                match shape {
+                    MaskShape::Rectangle => {
+                        filter.push_str(&format!(
+                            ",drawbox=x={x}:y={y}:w={bw}:h={bh}:color=white:t=fill"
+                        ));
+                        if feather > 0.05 {
+                            filter.push_str(&format!(
+                                ",boxblur=luma_radius={feather:.2}:luma_power=2"
+                            ));
+                        }
+                    }
+                    MaskShape::Oval => {
+                        let cx = *x as f32 + bw as f32 / 2.0;
+                        let cy = *y as f32 + bh as f32 / 2.0;
+                        let rx = bw as f32 / 2.0;
+                        let ry = bh as f32 / 2.0;
+                        let expr = if feather > 0.05 {
+                            let scale = rx.min(ry) / feather;
+                            format!(
+                                "255*clip((1-hypot((X-{cx:.2})/{rx:.2},(Y-{cy:.2})/{ry:.2}))*{scale:.3},0,1)"
+                            )
+                        } else {
+                            format!(
+                                "if(lte(hypot((X-{cx:.2})/{rx:.2},(Y-{cy:.2})/{ry:.2}),1),255,0)"
+                            )
+                        };
+                        filter.push_str(&format!(",geq=lum='{expr}'"));
+                    }
+                }
+                if *invert {
+                    filter.push_str(",negate");
+                }
+                filter.push_str(",format=gray");
+                filter
             }
             NodeKind::Output { .. } => return Err("internal: Output reached the filter arm".into()),
         };
@@ -1473,5 +1579,103 @@ mod tests {
             String::from_utf8_lossy(&proc.stderr)
         );
         assert_eq!(proc.stdout.len(), 640 * 360 * 4);
+    }
+
+    #[test]
+    fn mask_chain_compiles_to_matte_filters() {
+        use crate::graph::node::MaskMode;
+
+        let mut graph = Graph::default();
+        let video = graph.add_node(input(), [0.0, 0.0]);
+        let shape = graph.add_node(
+            NodeKind::ShapeMask {
+                shape: MaskShape::Rectangle,
+                width: 320,
+                height: 180,
+                x: 40,
+                y: 30,
+                feather: 12.0,
+                invert: false,
+                duration: 5.0,
+            },
+            [0.0, 0.0],
+        );
+        let blurred = graph.add_node(
+            NodeKind::MatteBlur {
+                blur: 2.0,
+                erode: 1,
+                dilate: 2,
+            },
+            [0.0, 0.0],
+        );
+        let combined = graph.add_node(
+            NodeKind::MaskCombine {
+                mode: MaskMode::Multiply,
+            },
+            [0.0, 0.0],
+        );
+        let key = graph.add_node(
+            NodeKind::AlphaKey {
+                mode: KeyMode::ExtractAlpha,
+                threshold: 0.5,
+                tolerance: 0.1,
+                softness: 0.1,
+            },
+            [0.0, 0.0],
+        );
+        let out = graph.add_node(output(640, 360), [0.0, 0.0]);
+
+        link(&mut graph, video, 0, key, 0);
+        link(&mut graph, shape, 0, combined, 0);
+        link(&mut graph, video, 0, blurred, 0);
+        link(&mut graph, blurred, 0, combined, 1);
+        link(&mut graph, combined, 0, key, 1);
+        link(&mut graph, key, 0, out, 0);
+
+        let compiled = compile(&graph).expect("mask chain compiles");
+        let filters = &compiled.filter_complex;
+        assert!(filters.contains("drawbox=x=40:y=30:w=320:h=180"));
+        assert!(filters.contains("boxblur=luma_radius=2.00"));
+        assert!(filters.contains(",erosion"));
+        assert!(filters.contains(",dilation"));
+        assert!(filters.contains("blend=all_mode=multiply"));
+        assert!(filters.contains("scale2ref"));
+        assert!(filters.contains("alphamerge"));
+    }
+
+    #[test]
+    fn oval_shape_mask_uses_geq() {
+        let mut graph = Graph::default();
+        let shape = graph.add_node(
+            NodeKind::ShapeMask {
+                shape: MaskShape::Oval,
+                width: 200,
+                height: 100,
+                x: 10,
+                y: 20,
+                feather: 0.0,
+                invert: true,
+                duration: 2.0,
+            },
+            [0.0, 0.0],
+        );
+        let key = graph.add_node(
+            NodeKind::AlphaKey {
+                mode: KeyMode::LumaKey,
+                threshold: 0.3,
+                tolerance: 0.1,
+                softness: 0.1,
+            },
+            [0.0, 0.0],
+        );
+        let out = graph.add_node(output(320, 180), [0.0, 0.0]);
+        let video = graph.add_node(input(), [0.0, 0.0]);
+        link(&mut graph, video, 0, key, 0);
+        link(&mut graph, shape, 0, key, 1);
+        link(&mut graph, key, 0, out, 0);
+
+        let compiled = compile(&graph).expect("oval mask compiles");
+        assert!(compiled.filter_complex.contains(",geq=lum='"));
+        assert!(compiled.filter_complex.contains(",negate"));
     }
 }

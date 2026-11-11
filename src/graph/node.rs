@@ -73,6 +73,28 @@ const TEXT_IN: [PortSpec; 1] = [PortSpec {
     kind: PortKind::Video,
     optional: true,
 }];
+const MASK_IN: [PortSpec; 1] = [PortSpec {
+    name: "mask",
+    kind: PortKind::Mask,
+    optional: false,
+}];
+const MASK_OUT: [PortSpec; 1] = [PortSpec {
+    name: "mask",
+    kind: PortKind::Mask,
+    optional: false,
+}];
+const MASK_COMBINE_IN: [PortSpec; 2] = [
+    PortSpec {
+        name: "mask a",
+        kind: PortKind::Mask,
+        optional: false,
+    },
+    PortSpec {
+        name: "mask b",
+        kind: PortKind::Mask,
+        optional: false,
+    },
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeyMode {
@@ -119,6 +141,50 @@ impl TextPos {
             TextPos::TopCenter => "Top center",
             TextPos::BottomCenter => "Bottom center",
             TextPos::CustomXY => "Custom X/Y",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MaskMode {
+    Multiply,
+    Addition,
+    Difference,
+}
+
+impl MaskMode {
+    pub const ALL: [MaskMode; 3] = [MaskMode::Multiply, MaskMode::Addition, MaskMode::Difference];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MaskMode::Multiply => "Multiply (AND)",
+            MaskMode::Addition => "Addition (OR)",
+            MaskMode::Difference => "Difference (XOR)",
+        }
+    }
+
+    pub fn ffmpeg(self) -> &'static str {
+        match self {
+            MaskMode::Multiply => "multiply",
+            MaskMode::Addition => "addition",
+            MaskMode::Difference => "difference",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MaskShape {
+    Rectangle,
+    Oval,
+}
+
+impl MaskShape {
+    pub const ALL: [MaskShape; 2] = [MaskShape::Rectangle, MaskShape::Oval];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MaskShape::Rectangle => "Rectangle",
+            MaskShape::Oval => "Oval",
         }
     }
 }
@@ -210,6 +276,27 @@ pub enum NodeKind {
         solarize: f32,
         threshold: f32,
     },
+    /// Blur, erode and dilate a single-channel matte.
+    MatteBlur {
+        blur: f32,
+        erode: u32,
+        dilate: u32,
+    },
+    /// Boolean-style combination of two matte streams.
+    MaskCombine {
+        mode: MaskMode,
+    },
+    /// Procedural rectangle/oval matte with a feathered edge.
+    ShapeMask {
+        shape: MaskShape,
+        width: u32,
+        height: u32,
+        x: i32,
+        y: i32,
+        feather: f32,
+        invert: bool,
+        duration: f32,
+    },
     Output {
         width: u32,
         height: u32,
@@ -263,19 +350,25 @@ impl NodeKind {
             NodeKind::ColorBalance { .. } => "Color Balance",
             NodeKind::Levels { .. } => "Levels",
             NodeKind::InvertSolarize { .. } => "Invert / Solarize",
+            NodeKind::MatteBlur { .. } => "Matte Blur / Erode / Dilate",
+            NodeKind::MaskCombine { .. } => "Mask Combine",
+            NodeKind::ShapeMask { .. } => "Shape Mask",
             NodeKind::Output { .. } => "Output",
         }
     }
 
     pub fn inputs(&self) -> &'static [PortSpec] {
         match self {
-            NodeKind::Input { .. } | NodeKind::Image { .. } | NodeKind::SolidColor { .. } => {
-                &NO_PORTS
-            }
+            NodeKind::Input { .. }
+            | NodeKind::Image { .. }
+            | NodeKind::SolidColor { .. }
+            | NodeKind::ShapeMask { .. } => &NO_PORTS,
             NodeKind::Output { .. } => &VIDEO_IN,
             NodeKind::Overlay { .. } => &OVERLAY_IN,
             NodeKind::AlphaKey { .. } => &ALPHA_KEY_IN,
             NodeKind::Text { .. } => &TEXT_IN,
+            NodeKind::MatteBlur { .. } => &MASK_IN,
+            NodeKind::MaskCombine { .. } => &MASK_COMBINE_IN,
             _ => &VIDEO_IN,
         }
     }
@@ -283,6 +376,9 @@ impl NodeKind {
     pub fn outputs(&self) -> &'static [PortSpec] {
         match self {
             NodeKind::Output { .. } => &NO_PORTS,
+            NodeKind::MatteBlur { .. }
+            | NodeKind::MaskCombine { .. }
+            | NodeKind::ShapeMask { .. } => &MASK_OUT,
             _ => &VIDEO_OUT,
         }
     }
@@ -384,6 +480,19 @@ impl NodeKind {
                 solarize,
                 threshold,
             } => format!("inv {invert:.2}  sol {solarize:.2}  t {threshold:.2}"),
+            NodeKind::MatteBlur {
+                blur,
+                erode,
+                dilate,
+            } => format!("blur {blur:.1}  erode {erode}  dilate {dilate}"),
+            NodeKind::MaskCombine { mode } => mode.label().to_string(),
+            NodeKind::ShapeMask {
+                shape,
+                width,
+                height,
+                feather,
+                ..
+            } => format!("{} {width}x{height} f{feather:.1}", shape.label()),
             NodeKind::Output { width, height } => format!("canvas {width}x{height}"),
         }
     }

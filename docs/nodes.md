@@ -11,7 +11,8 @@ For the pipeline that assembles these filters, see
 
 ## Ports
 
-- Every node has **one video output** except `Output`, which has none.
+- Every node has **one video output** except `Output` (none) and the three mask
+  nodes (`MatteBlur`, `MaskCombine`, `ShapeMask`), which output a single `Mask`.
 - A port is `Video`, `Mask`, or `Audio`.
 - `Video → Mask` is allowed. Every other connection requires equal kinds.
 - All inputs are **single-source**. Connecting a second wire replaces the first.
@@ -37,6 +38,9 @@ For the pipeline that assembles these filters, see
 | Color Balance | `video` | video |
 | Levels | `video` | video |
 | Invert / Solarize | `video` | video |
+| Matte Blur / Erode / Dilate | `mask` | mask |
+| Mask Combine | `mask a`, `mask b` | mask |
+| Shape Mask | none | mask |
 | Output | `video` | none |
 
 ## Palette defaults
@@ -61,6 +65,9 @@ These are the values created by the **Add node** buttons.
 | Color Balance | all nine values `0.0` |
 | Levels | black `0.0`, white `1.0`, gamma `1.0` per channel |
 | Invert / Solarize | invert `0.0`, solarize `0.0`, threshold `0.5` |
+| Matte Blur | blur `3.0`, erode `0`, dilate `0` |
+| Mask Combine | Multiply (AND) |
+| Shape Mask | rectangle 640×360 at 0,0, feather `20`, not inverted, 5 s |
 
 ---
 
@@ -348,6 +355,88 @@ setsar=1
 - Only the **first** `Output` node in node order is compiled. The palette prevents
   adding a second one; a hand-edited graph with two will silently ignore the
   extra.
+
+---
+
+## Masks
+
+A mask is a single-channel grayscale matte: white = opaque, black = transparent.
+Mask outputs cannot drive the `video` input of `Output` or most effects; connect
+them to the `mask (opt)` input of **Alpha Key**, or to another mask node. The
+compiler normalises every mask to `format=gray`.
+
+### Matte Blur / Erode / Dilate
+
+Softens or repairs a matte, for example after a chroma key or on a cropped edge.
+
+- **Input:** `mask` (required). **Output:** `mask`.
+- **Fields:** `blur`, `erode`, `dilate` (`f32`, `u32`, `u32`).
+- **UI ranges:** blur 0..50, erode 0..4 passes, dilate 0..4 passes.
+- **Default:** blur 3, erode 0, dilate 0.
+
+Mapping:
+
+```text
+format=gray,
+[boxblur=luma_radius=<blur>:luma_power=2,]   # only when blur > 0.05
+[erosion × erode]
+[dilation × dilate]
+format=gray
+```
+
+`blur` is clamped to `0..=100` and written with two decimals; the pass counts are
+clamped to `0..=4`. Blur runs before morphology. A `Video` source may be wired
+straight in; it is converted to luma first.
+
+### Mask Combine
+
+Boolean-style combination of two mattes.
+
+- **Inputs:** `mask a` and `mask b` (both required). **Output:** `mask`.
+- **Field:** `mode`.
+- **Values:** `Multiply` (intersection / AND), `Addition` (union / OR),
+  `Difference` (XOR). Default `Multiply`.
+
+Mapping:
+
+```text
+[mask b][mask a] scale2ref[b][a];
+[a][b] format=gray,blend=all_mode=<mode>:all_opacity=1,format=gray
+```
+
+`mask b` is scaled to `mask a`'s dimensions first because FFmpeg's `blend`
+requires matching sizes. `all_mode` values are `multiply`, `addition`, and
+`difference`.
+
+### Shape Mask
+
+A procedural rectangle or oval matte, optionally feathered.
+
+- **Inputs:** none. **Output:** `mask` (generated at the Output canvas size).
+- **Fields:** `shape`, `width`, `height`, `x`, `y`, `feather`, `invert`,
+  `duration`.
+- **UI ranges:** width/height 2..7680 (forced even), x/y −7680..7680, feather
+  0..200 px, duration 0.1..600 s.
+- **Default:** rectangle, 640×360 at (0,0), feather 20, not inverted, 5 s.
+
+Mapping (canvas dimensions `<W>`×`<H>`):
+
+```text
+color=c=black:s=<W>x<H>:d=<duration>:r=30,format=gray,
+rectangle: drawbox=x=<x>:y=<y>:w=<w>:h=<h>:color=white:t=fill
+oval:      geq=lum='<ellipse expression>'
+[boxblur=luma_radius=<feather>:luma_power=2]  # rectangle feather
+[negate]                                      # when invert
+format=gray
+```
+
+- The rectangle feather uses `boxblur`; the oval builds its falloff directly in
+  `geq`, using `hypot` around the ellipse centre and `clip()` for the edge ramp.
+- A feather of 0 gives hard edges.
+- Rectangle `drawbox` is clipped by the canvas automatically. The oval's `geq`
+  expression is evaluated per pixel, so it is slower than `drawbox`.
+- The node is a source: its own `duration` is independent of the timeline and it
+  is not gated by timeline clips.
 
 ---
 

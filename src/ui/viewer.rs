@@ -3,7 +3,7 @@
 use eframe::egui::{self, Color32, RichText};
 
 use super::App;
-use crate::preview::engine::{PREVIEW_H, PREVIEW_W};
+use crate::preview::{PREVIEW_H, PREVIEW_W};
 
 impl App {
     pub(crate) fn viewer(&mut self, parent: &mut egui::Ui) {
@@ -103,14 +103,13 @@ impl App {
                     });
 
                 ui.add_space(4.0);
-                ui.label(
-                    RichText::new(
-                        "Preview extracts one frame with -frames:v 1 and reads raw RGBA \
-                         from stdout. Old processes are killed when a newer request arrives.",
-                    )
-                    .small()
-                    .weak(),
-                );
+                #[cfg(not(target_arch = "wasm32"))]
+                let note = "Preview extracts one frame with -frames:v 1 and reads raw RGBA \
+                            from stdout. Old processes are killed when a newer request arrives.";
+                #[cfg(target_arch = "wasm32")]
+                let note = "Preview extracts one frame with -frames:v 1 into ffmpeg.wasm MEMFS \
+                            and reads it back as raw RGBA. Stale requests are discarded.";
+                ui.label(RichText::new(note).small().weak());
             });
     }
 }
